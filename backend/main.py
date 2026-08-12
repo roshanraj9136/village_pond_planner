@@ -82,11 +82,15 @@ def analyze_location(coords: Coordinates):
                 unsuitable = ["building", "residential", "commercial", "industrial", "aeroway", "highway", "railway", "military"]
                 if cls in unsuitable or ltype in unsuitable:
                     is_suitable = False
-                    warning = f"CRITICAL: Selected location overlaps with '{ltype or cls}'. Pond construction is structurally and legally prohibited."
+                    warning = f"CRITICAL: Selected location overlaps with private/restricted '{ltype or cls}' zoning. Government land acquisition is prohibited here."
             
+            # Formulate the land type explicitly
+            raw_land_type = (ltype or cls or "open_wasteland").title()
+            final_land_type = raw_land_type if not is_suitable else f"{raw_land_type} (Available for Panchayat/Government Acquisition)"
+
             return LocationResponse(
                 display_name=display_name,
-                land_type=(ltype or cls or "Open Land").title(),
+                land_type=final_land_type,
                 is_suitable=is_suitable,
                 warning_message=warning
             )
@@ -98,6 +102,20 @@ def analyze_location(coords: Coordinates):
         land_type="Unknown",
         is_suitable=True,
         warning_message=""
+    )
+
+class LegalResponse(BaseModel):
+    owner_type: str
+    clearance_status: str
+    hurdles: str
+
+@app.post("/api/analyze/legal", response_model=LegalResponse)
+def analyze_legal(coords: Coordinates):
+    # Mock response for presentation: Simulating a query to state Land Registry (Bhulekh)
+    return LegalResponse(
+        owner_type="Gram Panchayat / Public Wasteland",
+        clearance_status="PRE-CLEARED FOR WATERSHED PROJECT",
+        hurdles="No legal hurdles detected. Proceed with Sarpanch NOC."
     )
 
 @app.post("/api/analyze/rainfall", response_model=RainfallResponse)

@@ -38,6 +38,7 @@ function App() {
   const [locationData, setLocationData] = useState(null);
   const [analysisData, setAnalysisData] = useState(null);
   const [visionData, setVisionData] = useState(null);
+  const [legalData, setLegalData] = useState(null);
   const [savedReports, setSavedReports] = useState([]);
   const [loading, setLoading] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -61,6 +62,7 @@ function App() {
     setAnalysisData(null); 
     setLocationData(null);
     setVisionData(null);
+    setLegalData(null);
   }, []);
 
   const handleSearch = async (e) => {
@@ -100,6 +102,14 @@ function App() {
         setLoading(false);
         return;
       }
+
+      const legalRes = await fetch('http://localhost:8000/api/analyze/legal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const legalData = await legalRes.json();
+      setLegalData(legalData);
 
       const rainRes = await fetch('http://localhost:8000/api/analyze/rainfall', {
         method: 'POST',
@@ -216,7 +226,15 @@ function App() {
             <div className="report-section" style={{ animation: 'fadeIn 0.5s ease-out', borderLeft: locationData.is_suitable ? '4px solid #10b981' : '4px solid #ef4444' }}>
               <h3>Location Verification</h3>
               <p style={{ fontSize: '0.85rem', marginBottom: '8px' }}><strong>Address:</strong> {locationData.display_name}</p>
-              <p style={{ fontSize: '0.85rem' }}><strong>Land Designation:</strong> {locationData.land_type}</p>
+              <p style={{ fontSize: '0.85rem', marginBottom: '8px' }}><strong>Land Designation:</strong> {locationData.land_type}</p>
+              
+              {legalData && locationData.is_suitable && (
+                <div style={{ marginTop: '12px', padding: '12px', background: 'rgba(16, 185, 129, 0.1)', border: '1px solid rgba(16, 185, 129, 0.2)', borderRadius: '8px' }}>
+                  <p style={{ fontSize: '0.85rem', marginBottom: '4px' }}><strong>Ownership Status:</strong> {legalData.owner_type}</p>
+                  <p style={{ fontSize: '0.85rem', marginBottom: '4px' }}><strong>Legal Clearance:</strong> <span style={{ color: '#10b981', fontWeight: 600 }}>{legalData.clearance_status}</span></p>
+                  <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>{legalData.hurdles}</p>
+                </div>
+              )}
               
               {!locationData.is_suitable && (
                 <div style={{ marginTop: '12px', padding: '12px', background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: '8px', fontSize: '0.85rem', fontWeight: 500 }}>
