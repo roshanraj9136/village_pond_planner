@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { MapContainer, TileLayer, useMapEvents, ZoomControl, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, useMapEvents, ZoomControl, useMap, LayersControl, Circle, Popup } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import './index.css';
 
@@ -37,12 +37,30 @@ function App() {
   const [selectedLocation, setSelectedLocation] = useState(null);
   const [locationData, setLocationData] = useState(null);
   const [analysisData, setAnalysisData] = useState(null);
+  const [visionData, setVisionData] = useState(null);
+  const [savedReports, setSavedReports] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  const fetchReports = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/reports');
+      const data = await res.json();
+      setSavedReports(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+  
+  useEffect(() => {
+    fetchReports();
+  }, []);
 
   const handleCenterChange = useCallback((latlng) => {
     setSelectedLocation(latlng);
     setAnalysisData(null); 
     setLocationData(null);
+    setVisionData(null);
   }, []);
 
   const handleSearch = async (e) => {
@@ -50,7 +68,7 @@ function App() {
     if (!searchQuery.trim()) return;
     
     try {
-      const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery)}&format=json&limit=1&countrycodes=in`);
+      const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery)}&format=json&limit=1&countrycodes=in&accept-language=en`);
       const data = await res.json();
       if (data && data.length > 0) {
         setTargetCenter([parseFloat(data[0].lat), parseFloat(data[0].lon)]);
@@ -97,6 +115,18 @@ function App() {
       });
       const terrainData = await terrainRes.json();
 
+      try {
+        const visionRes = await fetch('http://localhost:8000/api/analyze/vision', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const visData = await visionRes.json();
+        setVisionData(visData);
+      } catch (err) {
+        console.error("OpenCV processing failed", err);
+      }
+
       setAnalysisData({ ...rainData, ...terrainData });
     } catch (error) {
       console.error("Analysis Error:", error);
@@ -106,9 +136,46 @@ function App() {
     }
   };
 
+  const saveReport = async () => {
+    if (!analysisData || !locationData || !visionData) return;
+    try {
+      const payload = {
+        lat: selectedLocation.lat,
+        lng: selectedLocation.lng,
+        display_name: locationData.display_name,
+        catchment_area: analysisData.catchment_area_sq_meters,
+        pond_depth: analysisData.recommended_pond_depth_meters,
+        storage_capacity: analysisData.estimated_storage_capacity,
+        vegetation: visionData.vegetation_percentage,
+        water: visionData.water_body_percentage
+      };
+      await fetch('http://localhost:8000/api/reports', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      alert('Report saved to database successfully!');
+      fetchReports();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to save to database.');
+    }
+  };
+
+  const deleteReport = async (id, e) => {
+    e.stopPropagation();
+    try {
+      await fetch(`http://localhost:8000/api/reports/${id}`, { method: 'DELETE' });
+      fetchReports();
+    } catch (err) {
+      console.error(err);
+      alert('Failed to delete report.');
+    }
+  };
+
   return (
     <div className="app-container">
-      <div className="sidebar">
+      <div className={`sidebar ${isSidebarOpen ? '' : 'closed'}`}>
         <div className="header">
           <h1>PondSight System</h1>
           <p>Geospatial AI Analysis Dashboard</p>
@@ -199,10 +266,64 @@ function App() {
                   Depth calculation factors in 1.5m annual evaporation loss and 0.5m seepage loss specific to the Indian subcontinent.
                 </p>
               </div>
+
+              <div className="report-section">
+                <h3>Computer Vision Analysis</h3>
+                {visionData ? (
+                  <div className="data-grid">
+                    <div className="data-item">
+                      <span className="data-label">Vegetation Cover</span>
+                      <span className="data-value">{visionData.vegetation_percentage}%</span>
+                    </div>
+                    <div className="data-item">
+                      <span className="data-label">Surface Water</span>
+                      <span className="data-value">{visionData.water_body_percentage}%</span>
+                    </div>
+                  </div>
+                ) : (
+                  <p style={{ fontSize: '0.85rem' }}>Processing satellite imagery with OpenCV...</p>
+                )}
+                
+                {visionData && (
+                  <button className="btn-secondary" onClick={saveReport} style={{ marginTop: '20px', width: '100%' }}>
+                    💾 Save Approved Site to Database
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {savedReports.length > 0 && (
+            <div className="report-section">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                <h3 style={{ margin: 0, borderBottom: 'none', paddingBottom: 0 }}>Database: Approved Sites</h3>
+                <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', background: 'rgba(255,255,255,0.1)', padding: '2px 8px', borderRadius: '12px' }}>{savedReports.length} Saved</span>
+              </div>
+              <div style={{ maxHeight: '220px', overflowY: 'auto', paddingRight: '4px' }}>
+                <ul style={{ listStyle: 'none', padding: 0, fontSize: '0.85rem' }}>
+                  {savedReports.map(r => (
+                    <li key={r.id} style={{ padding: '12px 0', borderTop: '1px solid rgba(255,255,255,0.05)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }} onClick={() => setTargetCenter([r.lat, r.lng])}>
+                      <div style={{ display: 'flex', alignItems: 'center' }}>
+                        <span style={{ color: '#ef4444', marginRight: '10px', fontSize: '1.1rem' }}>📍</span> 
+                        <span style={{ color: '#ededed' }}>{r.display_name.split(',')[0]} - <strong style={{ color: '#ffffff' }}>{r.storage_capacity.toLocaleString()} m³</strong></span>
+                      </div>
+                      <button onClick={(e) => deleteReport(r.id, e)} style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '1.2rem', marginLeft: '8px' }} title="Delete site">×</button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             </div>
           )}
         </div>
       </div>
+
+      <button 
+        className={`toggle-sidebar-btn ${isSidebarOpen ? '' : 'closed'}`}
+        onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+        title="Toggle Dashboard"
+      >
+        {isSidebarOpen ? '◀' : '▶'}
+      </button>
 
       <div className="map-container">
         <div className="center-target">
@@ -218,12 +339,60 @@ function App() {
           style={{ width: '100%', height: '100%' }}
         >
           <ZoomControl position="bottomright" />
-          <TileLayer
-            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-            attribution='&copy; <a href="https://www.esri.com/">Esri</a>'
-          />
+          <LayersControl position="topright">
+            <LayersControl.BaseLayer checked name="Satellite">
+              <TileLayer
+                url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                attribution='&copy; <a href="https://www.esri.com/">Esri</a>'
+              />
+            </LayersControl.BaseLayer>
+            <LayersControl.BaseLayer name="Contour (Topography)">
+              <TileLayer
+                url="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png"
+                attribution='Map data: &copy; OpenStreetMap contributors, SRTM | Map style: &copy; OpenTopoMap (CC-BY-SA)'
+              />
+            </LayersControl.BaseLayer>
+          </LayersControl>
           <MapCenterTracker onCenterChange={handleCenterChange} />
           <MapController targetCenter={targetCenter} />
+
+          {/* Database Saved Sites Overlays */}
+          {savedReports.map(report => (
+            <Circle 
+              key={report.id}
+              center={[report.lat, report.lng]} 
+              radius={Math.sqrt((report.storage_capacity / report.pond_depth) / Math.PI)}
+              pathOptions={{ color: '#ef4444', fillColor: '#ef4444', fillOpacity: 0.6, weight: 2 }}
+            >
+              <Popup>
+                <strong>{report.display_name.split(',')[0]}</strong><br/>
+                Capacity: {report.storage_capacity.toLocaleString()} m³<br/>
+                Vegetation: {report.vegetation}%
+              </Popup>
+            </Circle>
+          ))}
+
+          {analysisData && locationData?.is_suitable && selectedLocation && (
+            <>
+              {/* Catchment Area */}
+              <Circle 
+                center={[selectedLocation.lat, selectedLocation.lng]} 
+                radius={Math.sqrt(analysisData.catchment_area_sq_meters / Math.PI)}
+                pathOptions={{ color: '#3b82f6', fillColor: '#3b82f6', fillOpacity: 0.2, dashArray: '5, 5' }}
+              >
+                <Popup>Estimated Catchment Area: {(analysisData.catchment_area_sq_meters / 10000).toFixed(1)} ha</Popup>
+              </Circle>
+              
+              {/* Pond Location */}
+              <Circle 
+                center={[selectedLocation.lat, selectedLocation.lng]} 
+                radius={Math.sqrt((analysisData.estimated_storage_capacity / analysisData.recommended_pond_depth_meters) / Math.PI)}
+                pathOptions={{ color: '#10b981', fillColor: '#10b981', fillOpacity: 0.8 }}
+              >
+                <Popup>Recommended Pond Location</Popup>
+              </Circle>
+            </>
+          )}
         </MapContainer>
       </div>
     </div>

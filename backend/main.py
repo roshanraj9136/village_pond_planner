@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
 import math
+import sqlite3
+import cv2
+import numpy as np
+from typing import List
 
 app = FastAPI(title="AI-based Village Pond Planning System")
 
@@ -13,6 +17,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def init_db():
+    conn = sqlite3.connect("ponds.db")
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS reports
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  lat REAL, lng REAL, display_name TEXT,
+                  catchment_area REAL, pond_depth REAL,
+                  storage_capacity REAL, vegetation REAL, water REAL)''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 class Coordinates(BaseModel):
     lat: float
@@ -43,7 +60,7 @@ def read_root():
 
 @app.post("/api/analyze/location", response_model=LocationResponse)
 def analyze_location(coords: Coordinates):
-    url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={coords.lat}&lon={coords.lng}&zoom=18&addressdetails=1"
+    url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={coords.lat}&lon={coords.lng}&zoom=18&addressdetails=1&accept-language=en"
     headers = {"User-Agent": "PondSight-University-Project/1.0"}
     try:
         response = requests.get(url, headers=headers, timeout=5)
@@ -93,7 +110,7 @@ def analyze_rainfall(coords: Coordinates):
         valid = [p for p in daily if p is not None]
         total_annual = sum(valid)
         return RainfallResponse(annual_rainfall_mm=round(total_annual, 2), average_monthly_mm=round(total_annual / 12, 2))
-    except:
+    except Exception:
         return RainfallResponse(annual_rainfall_mm=850.0, average_monthly_mm=70.8)
 
 @app.post("/api/analyze/terrain", response_model=TerrainResponse)
@@ -156,3 +173,96 @@ def analyze_terrain(coords: Coordinates):
         runoff_coefficient=runoff_coefficient,
         annual_rainfall_mm=round(annual_rainfall_mm, 2)
     )
+
+class VisionResponse(BaseModel):
+    vegetation_percentage: float
+    water_body_percentage: float
+    message: str
+
+def deg2num(lat_deg, lon_deg, zoom):
+    lat_rad = math.radians(lat_deg)
+    n = 2.0 ** zoom
+    xtile = int((lon_deg + 180.0) / 360.0 * n)
+    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
+    return (xtile, ytile)
+
+@app.post("/api/analyze/vision", response_model=VisionResponse)
+def analyze_vision(coords: Coordinates):
+    try:
+        z = 16
+        x, y = deg2num(coords.lat, coords.lng, z)
+        tile_url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        
+        headers = {"User-Agent": "PondSight-University-Project/1.0"}
+        resp = requests.get(tile_url, headers=headers, timeout=5)
+        
+        if resp.status_code == 200:
+            nparr = np.frombuffer(resp.content, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if img is not None:
+                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+                
+                # Green vegetation
+                lower_green = np.array([30, 40, 40])
+                upper_green = np.array([85, 255, 255])
+                mask_green = cv2.inRange(hsv, lower_green, upper_green)
+                veg_pixels = cv2.countNonZero(mask_green)
+                
+                # Water bodies (blue/dark)
+                lower_water = np.array([90, 40, 40])
+                upper_water = np.array([130, 255, 255])
+                mask_water = cv2.inRange(hsv, lower_water, upper_water)
+                water_pixels = cv2.countNonZero(mask_water)
+                
+                total_pixels = img.shape[0] * img.shape[1]
+                veg_percent = round((veg_pixels / total_pixels) * 100, 2)
+                water_percent = round((water_pixels / total_pixels) * 100, 2)
+                
+                return VisionResponse(vegetation_percentage=veg_percent, water_body_percentage=water_percent, message="OpenCV complete")
+    except Exception as e:
+        pass
+        
+    return VisionResponse(vegetation_percentage=0.0, water_body_percentage=0.0, message="OpenCV failed")
+
+class Report(BaseModel):
+    lat: float
+    lng: float
+    display_name: str
+    catchment_area: float
+    pond_depth: float
+    storage_capacity: float
+    vegetation: float
+    water: float
+
+class SavedReport(Report):
+    id: int
+
+@app.post("/api/reports")
+def save_report(report: Report):
+    conn = sqlite3.connect("ponds.db")
+    c = conn.cursor()
+    c.execute('''INSERT INTO reports (lat, lng, display_name, catchment_area, pond_depth, storage_capacity, vegetation, water)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', 
+              (report.lat, report.lng, report.display_name, report.catchment_area, report.pond_depth, report.storage_capacity, report.vegetation, report.water))
+    conn.commit()
+    conn.close()
+    return {"message": "Report saved successfully"}
+
+@app.get("/api/reports", response_model=List[SavedReport])
+def get_reports():
+    conn = sqlite3.connect("ponds.db")
+    c = conn.cursor()
+    c.execute("SELECT id, lat, lng, display_name, catchment_area, pond_depth, storage_capacity, vegetation, water FROM reports")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "lat": r[1], "lng": r[2], "display_name": r[3], "catchment_area": r[4], "pond_depth": r[5], "storage_capacity": r[6], "vegetation": r[7], "water": r[8]} for r in rows]
+
+@app.delete("/api/reports/{report_id}")
+def delete_report(report_id: int):
+    conn = sqlite3.connect("ponds.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Report deleted successfully"}
