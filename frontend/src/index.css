@@ -88,26 +88,27 @@ body {
 }
 
 .header {
-  padding: 32px 28px;
-  border-bottom: 1px solid var(--border-color);
+  padding: 36px 28px 32px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   background: rgba(2, 6, 23, 0.3);
+  text-align: center;
 }
 
 .header h1 {
-  font-size: 1.5rem;
-  font-weight: 700;
-  background: linear-gradient(135deg, #38bdf8, #818cf8);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  margin-bottom: 6px;
-  letter-spacing: -0.03em;
-  text-shadow: 0 0 20px rgba(56, 189, 248, 0.2);
+  font-size: 2.1rem;
+  font-weight: 800;
+  color: #ffffff;
+  margin-bottom: 8px;
+  letter-spacing: -0.04em;
+  text-shadow: 0 4px 20px rgba(56, 189, 248, 0.3);
 }
 
 .header p {
-  font-size: 0.85rem;
-  color: var(--text-muted);
-  font-weight: 400;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #38bdf8;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
 }
 
 .scroll-content {
