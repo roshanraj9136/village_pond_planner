@@ -42,6 +42,15 @@ class LocationResponse(BaseModel):
     warning_message: str
 
 
+class RainfallResponse(BaseModel):
+    annual_rainfall_mm: float
+    average_monthly_mm: float
+
+class TerrainRequest(BaseModel):
+    lat: float
+    lng: float
+    annual_rainfall_mm: float
+
 class TerrainResponse(BaseModel):
     elevation_meters: float
     catchment_area_sq_meters: float
@@ -117,11 +126,24 @@ def analyze_legal(coords: Coordinates):
 
 
 
+@app.post("/api/analyze/rainfall", response_model=RainfallResponse)
+def analyze_rainfall(coords: Coordinates):
+    url = f"https://archive-api.open-meteo.com/v1/archive?latitude={coords.lat}&longitude={coords.lng}&start_date=2023-01-01&end_date=2023-12-31&daily=precipitation_sum&timezone=auto"
+    try:
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        daily = data.get("daily", {}).get("precipitation_sum", [])
+        valid = [p for p in daily if p is not None]
+        total_annual = sum(valid)
+        return RainfallResponse(annual_rainfall_mm=round(total_annual, 2), average_monthly_mm=round(total_annual / 12, 2))
+    except Exception:
+        return RainfallResponse(annual_rainfall_mm=850.0, average_monthly_mm=70.8)
+
 @app.post("/api/analyze/terrain", response_model=TerrainResponse)
-def analyze_terrain(coords: Coordinates):
+def analyze_terrain(req: TerrainRequest):
     offset = 0.00045 
-    lats = f"{coords.lat},{coords.lat+offset},{coords.lat-offset},{coords.lat},{coords.lat}"
-    lngs = f"{coords.lng},{coords.lng},{coords.lng},{coords.lng+offset},{coords.lng-offset}"
+    lats = f"{req.lat},{req.lat+offset},{req.lat-offset},{req.lat},{req.lat}"
+    lngs = f"{req.lng},{req.lng},{req.lng},{req.lng+offset},{req.lng-offset}"
     
     elevation_url = f"https://api.open-meteo.com/v1/elevation?latitude={lats}&longitude={lngs}"
     try:
@@ -136,15 +158,7 @@ def analyze_terrain(coords: Coordinates):
     dz_dy = (north_elev - south_elev) / 100.0
     slope_percent = math.sqrt(dz_dx**2 + dz_dy**2) * 100.0
 
-    rain_url = f"https://archive-api.open-meteo.com/v1/archive?latitude={coords.lat}&longitude={coords.lng}&start_date=2023-01-01&end_date=2023-12-31&daily=precipitation_sum&timezone=auto"
-    try:
-        rain_response = requests.get(rain_url, timeout=10)
-        rain_data = rain_response.json().get("daily", {}).get("precipitation_sum", [])
-        annual_rainfall_mm = sum([p for p in rain_data if p is not None])
-    except Exception:
-        annual_rainfall_mm = 850.0
-        
-    rainfall_meters = annual_rainfall_mm / 1000.0
+    rainfall_meters = req.annual_rainfall_mm / 1000.0
 
     if slope_percent < 2.0:
         catchment_area_sqm = 500000.0
