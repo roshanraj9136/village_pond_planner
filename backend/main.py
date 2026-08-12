@@ -41,10 +41,7 @@ class LocationResponse(BaseModel):
     is_suitable: bool
     warning_message: str
 
-class RainfallResponse(BaseModel):
-    annual_rainfall_mm: float
-    average_monthly_mm: float
-    
+
 class TerrainResponse(BaseModel):
     elevation_meters: float
     catchment_area_sq_meters: float
@@ -118,18 +115,7 @@ def analyze_legal(coords: Coordinates):
         hurdles="No legal hurdles detected. Proceed with Sarpanch NOC."
     )
 
-@app.post("/api/analyze/rainfall", response_model=RainfallResponse)
-def analyze_rainfall(coords: Coordinates):
-    url = f"https://archive-api.open-meteo.com/v1/archive?latitude={coords.lat}&longitude={coords.lng}&start_date=2023-01-01&end_date=2023-12-31&daily=precipitation_sum&timezone=auto"
-    try:
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        daily = data.get("daily", {}).get("precipitation_sum", [])
-        valid = [p for p in daily if p is not None]
-        total_annual = sum(valid)
-        return RainfallResponse(annual_rainfall_mm=round(total_annual, 2), average_monthly_mm=round(total_annual / 12, 2))
-    except Exception:
-        return RainfallResponse(annual_rainfall_mm=850.0, average_monthly_mm=70.8)
+
 
 @app.post("/api/analyze/terrain", response_model=TerrainResponse)
 def analyze_terrain(coords: Coordinates):

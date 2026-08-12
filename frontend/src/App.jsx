@@ -111,13 +111,6 @@ function App() {
       const legalData = await legalRes.json();
       setLegalData(legalData);
 
-      const rainRes = await fetch('http://localhost:8000/api/analyze/rainfall', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      const rainData = await rainRes.json();
-
       const terrainRes = await fetch('http://localhost:8000/api/analyze/terrain', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -137,7 +130,7 @@ function App() {
         console.error("OpenCV processing failed", err);
       }
 
-      setAnalysisData({ ...rainData, ...terrainData });
+      setAnalysisData(terrainData);
     } catch (error) {
       console.error("Analysis Error:", error);
       alert("Failed to connect to backend server.");
