@@ -187,8 +187,8 @@ function App() {
     <div className="app-container">
       <div className={`sidebar ${isSidebarOpen ? '' : 'closed'}`}>
         <div className="header">
-          <h1>PondSight System</h1>
-          <p>Geospatial AI Analysis Dashboard</p>
+          <h1>JalDrishti</h1>
+          <p>Geospatial Watershed Analysis</p>
         </div>
         
         <div className="scroll-content">
