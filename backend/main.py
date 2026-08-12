@@ -189,7 +189,7 @@ def analyze_terrain(req: TerrainRequest):
         recommended_pond_depth_meters=recommended_depth,
         estimated_storage_capacity=round(storage_capacity, 2),
         runoff_coefficient=runoff_coefficient,
-        annual_rainfall_mm=round(annual_rainfall_mm, 2)
+        annual_rainfall_mm=round(req.annual_rainfall_mm, 2)
     )
 
 class VisionResponse(BaseModel):
