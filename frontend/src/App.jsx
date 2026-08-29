@@ -256,8 +256,13 @@ function App() {
     <div className="app-container">
       <div className={`sidebar ${isSidebarOpen ? '' : 'closed'}`}>
         <div className="header">
-          <h1>JalDrishti</h1>
-          <p>AI-Powered Village Pond & Catchment Planner</p>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '12px', marginBottom: '8px' }}>
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" style={{width: '36px', height: '36px', color: '#38bdf8'}}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S12 3 12 3s-4.5 3.97-4.5 9 2.015 9 4.5 9zm0 0c-2.485 0-4.5-4.03-4.5-9 0-3.931 1.745-6.814 3-8.243M12 21c2.485 0 4.5-4.03 4.5-9 0-3.931-1.745-6.814-3-8.243" />
+            </svg>
+            <h1 style={{ marginBottom: 0 }}>JalDrishti</h1>
+          </div>
+          <p>Advanced Village Pond & Catchment Planner</p>
         </div>
 
         <div className="scroll-content">
@@ -267,13 +272,13 @@ function App() {
               className={`mode-tab ${activeTab === 'contour' ? 'active' : ''}`}
               onClick={() => setActiveTab('contour')}
             >
-              🗺️ Contour Map (KML/KMZ)
+               Contour Map (KML/KMZ)
             </button>
             <button 
               className={`mode-tab ${activeTab === 'point' ? 'active' : ''}`}
               onClick={() => setActiveTab('point')}
             >
-              📍 Pinpoint Analysis
+               Pinpoint Analysis
             </button>
           </div>
 
@@ -295,7 +300,7 @@ function App() {
                 className="upload-dropzone"
                 onClick={() => fileInputRef.current?.click()}
               >
-                <span className="upload-icon">📁</span>
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" style={{width: '32px', height: '32px', margin: '0 auto 8px auto', display: 'block', color: '#38bdf8'}}><path strokeLinecap="round" strokeLinejoin="round" d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" /></svg>
                 <div className="upload-title">
                   {uploadFileName || "Upload Contour Map (.KML / .KMZ)"}
                 </div>
@@ -309,7 +314,7 @@ function App() {
                 onClick={handleLoadSampleContour}
                 disabled={loading}
               >
-                <span>⚡</span> Run Sample Map (<code>contours_1m.kml</code>)
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" style={{width: '18px', height: '18px'}}><path strokeLinecap="round" strokeLinejoin="round" d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z" /></svg> Run Sample Map (<code>contours_1m.kml</code>)
               </button>
 
               {loading && (
@@ -395,11 +400,11 @@ function App() {
                       </div>
                       <div className="data-item">
                         <span className="data-label">Est. Runoff Volume</span>
-                        <span className="data-value highlight-success">{contourData.catchment_analysis.estimated_runoff_volume_cubic_meters.toLocaleString()} m³</span>
+                        <span className="data-value highlight-success">{contourData.catchment_analysis.estimated_runoff_volume_cubic_meters.toLocaleString()} m</span>
                       </div>
                       <div className="data-item">
                         <span className="data-label">Pond Surface Area</span>
-                        <span className="data-value">{contourData.catchment_analysis.recommended_pond_surface_area_sq_meters.toLocaleString()} m²</span>
+                        <span className="data-value">{contourData.catchment_analysis.recommended_pond_surface_area_sq_meters.toLocaleString()} m</span>
                       </div>
                       <div className="data-item">
                         <span className="data-label">Optimal Pond Depth</span>
@@ -408,7 +413,7 @@ function App() {
                     </div>
                     <div style={{ marginTop: '12px', padding: '12px', background: 'rgba(16, 185, 129, 0.08)', borderRadius: '8px', border: '1px solid rgba(16, 185, 129, 0.2)' }}>
                       <span style={{ fontSize: '0.8rem', color: '#10b981', fontWeight: 600 }}>
-                        Estimated Storage Capacity: {contourData.catchment_analysis.estimated_storage_capacity_cubic_meters.toLocaleString()} m³
+                        Estimated Storage Capacity: {contourData.catchment_analysis.estimated_storage_capacity_cubic_meters.toLocaleString()} m
                       </span>
                     </div>
                   </div>
@@ -490,7 +495,7 @@ function App() {
                       </div>
                       <div className="data-item">
                         <span className="data-label">Runoff Volume (Q)</span>
-                        <span className="data-value">{analysisData.estimated_runoff_volume_cubic_meters.toLocaleString()} m³</span>
+                        <span className="data-value">{analysisData.estimated_runoff_volume_cubic_meters.toLocaleString()} m</span>
                       </div>
                     </div>
                   </div>
@@ -504,7 +509,7 @@ function App() {
                       </div>
                       <div className="data-item">
                         <span className="data-label">Storage Capacity</span>
-                        <span className="data-value highlight-success">{analysisData.estimated_storage_capacity.toLocaleString()} m³</span>
+                        <span className="data-value highlight-success">{analysisData.estimated_storage_capacity.toLocaleString()} m</span>
                       </div>
                     </div>
                   </div>
@@ -527,8 +532,9 @@ function App() {
                     )}
 
                     {visionData && (
-                      <button className="btn-secondary" onClick={saveReport} style={{ marginTop: '20px', width: '100%' }}>
-                        💾 Save Approved Site to Database
+                      <button className="btn-secondary" onClick={saveReport} style={{ marginTop: '20px', width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" style={{width: '18px', height: '18px', marginRight: '8px'}}><path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" /></svg>
+                        Save Approved Site to Database
                       </button>
                     )}
                   </div>
@@ -551,10 +557,12 @@ function App() {
                       setTargetCenter([r.lat, r.lng]);
                     }}>
                       <div style={{ display: 'flex', alignItems: 'center' }}>
-                        <span style={{ color: '#ef4444', marginRight: '10px', fontSize: '1.1rem' }}>📍</span> 
-                        <span style={{ color: '#ededed' }}>{r.display_name.split(',')[0]} - <strong style={{ color: '#ffffff' }}>{r.storage_capacity.toLocaleString()} m³</strong></span>
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" style={{width: '18px', height: '18px', color: '#ef4444', marginRight: '8px'}}><path strokeLinecap="round" strokeLinejoin="round" d="M15 10.5a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 10.5c0 7.142-7.5 11.25-7.5 11.25S4.5 17.642 4.5 10.5a7.5 7.5 0 1115 0z" /></svg> 
+                        <span style={{ color: '#ededed' }}>{r.display_name.split(',')[0]} - <strong style={{ color: '#ffffff' }}>{r.storage_capacity.toLocaleString()} m</strong></span>
                       </div>
-                      <button onClick={(e) => deleteReport(r.id, e)} style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '1.2rem', marginLeft: '8px' }} title="Delete site">×</button>
+                      <button onClick={(e) => deleteReport(r.id, e)} style={{ background: 'none', border: 'none', color: '#71717a', cursor: 'pointer', fontSize: '1.2rem', marginLeft: '8px' }} title="Delete site">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" style={{width: '18px', height: '18px'}}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
+                      </button>
                     </li>
                   ))}
                 </ul>
@@ -569,7 +577,11 @@ function App() {
         onClick={() => setIsSidebarOpen(!isSidebarOpen)}
         title="Toggle Dashboard"
       >
-        {isSidebarOpen ? '◀' : '▶'}
+        {isSidebarOpen ? (
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" style={{width: '18px', height: '18px'}}><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" /></svg>
+        ) : (
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" style={{width: '18px', height: '18px'}}><path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" /></svg>
+        )}
       </button>
 
       <div className="map-container">
@@ -632,7 +644,7 @@ function App() {
                     <strong style={{ fontSize: '1rem', color: '#047857' }}>Optimal Pond Site</strong><br/>
                     <strong>Elevation:</strong> {contourData.pond_location.elevation_meters} m<br/>
                     <strong>Catchment:</strong> {contourData.catchment_analysis.catchment_area_hectares} ha<br/>
-                    <strong>Storage:</strong> {contourData.catchment_analysis.estimated_storage_capacity_cubic_meters.toLocaleString()} m³<br/>
+                    <strong>Storage:</strong> {contourData.catchment_analysis.estimated_storage_capacity_cubic_meters.toLocaleString()} m<br/>
                     <strong>Depth:</strong> {contourData.catchment_analysis.recommended_pond_depth_meters} m
                   </div>
                 </Popup>
@@ -654,7 +666,7 @@ function App() {
             >
               <Popup>
                 <strong>{report.display_name.split(',')[0]}</strong><br/>
-                Capacity: {report.storage_capacity.toLocaleString()} m³<br/>
+                Capacity: {report.storage_capacity.toLocaleString()} m<br/>
                 Vegetation: {report.vegetation}%
               </Popup>
             </Circle>

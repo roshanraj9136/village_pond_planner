@@ -78,7 +78,8 @@ def parse_contours_from_kml(kml_text):
         raise ValueError("Could not extract any contours with elevation data.")
     return contours
 
-def get_d8_flow_direction(dem):
+def get_d8_flow_direction(dem, dx_m, dy_m):
+    import math
     rows, cols = dem.shape
     flow_dir = np.zeros((rows, cols), dtype=np.int8)
     padded = np.pad(dem, 1, mode='constant', constant_values=np.inf)
@@ -89,15 +90,19 @@ def get_d8_flow_direction(dem):
     for r in range(rows):
         for c in range(cols):
             center_val = padded[r+1, c+1]
-            min_val = center_val
+            max_slope = 0.0
             best_dir = -1
 
             for i in range(8):
                 nr = r + 1 + dr[i]
                 nc = c + 1 + dc[i]
-                if padded[nr, nc] < min_val:
-                    min_val = padded[nr, nc]
-                    best_dir = i
+                drop = center_val - padded[nr, nc]
+                if drop > 0:
+                    dist = math.hypot(dr[i] * dy_m, dc[i] * dx_m)
+                    slope = drop / dist
+                    if slope > max_slope:
+                        max_slope = slope
+                        best_dir = i
 
             flow_dir[r, c] = best_dir
     return flow_dir, dr, dc
@@ -134,7 +139,7 @@ def get_flow_accumulation(flow_dir, dr, dc):
 
     return accumulation
 
-def analyze_terrain(contours, grid_size=150):
+def analyze_terrain(contours, grid_size=250):
     pts, elevs = [], []
     for c in contours:
         for lng, lat in c['coordinates']:
@@ -146,6 +151,8 @@ def analyze_terrain(contours, grid_size=150):
 
     min_lng, min_lat = np.min(pts, axis=0)
     max_lng, max_lat = np.max(pts, axis=0)
+    if max_lng == min_lng: max_lng += 0.0001
+    if max_lat == min_lat: max_lat += 0.0001
 
     meters_per_lat = 111320.0
     meters_per_lng = 111320.0 * math.cos(math.radians((min_lat + max_lat) / 2))
@@ -167,7 +174,7 @@ def analyze_terrain(contours, grid_size=150):
     slope_percent = np.sqrt(gx_grad**2 + gy_grad**2) * 100
     avg_slope = float(np.mean(slope_percent))
 
-    flow_dir, dr, dc = get_d8_flow_direction(dem)
+    flow_dir, dr, dc = get_d8_flow_direction(dem, dx_m, dy_m)
     flow_acc = get_flow_accumulation(flow_dir, dr, dc)
 
     inner_acc = flow_acc[5:-5, 5:-5]
@@ -220,10 +227,10 @@ def analyze_terrain(contours, grid_size=150):
     except:
         pass
 
-    c_coeff = 0.2 if avg_slope < 2 else 0.35 if avg_slope < 7 else 0.5 if avg_slope < 15 else 0.65
+    c_coeff = 0.1 if avg_slope < 2 else 0.15 if avg_slope < 7 else 0.25 if avg_slope < 15 else 0.30
     runoff_m3 = round(c_coeff * (annual_rainfall_mm / 1000.0) * catchment_area_sqm, 2)
 
-    pond_area = min(catchment_area_sqm * 0.1, max(2500.0, runoff_m3 / 3.0))
+    pond_area = min(catchment_area_sqm * 0.1, max(2500.0, runoff_m3 / 2.0))
     active_depth = runoff_m3 / max(1.0, pond_area)
     depth = round(max(2.5, min(5.5, 2.0 + active_depth * 0.5)), 2)
 
