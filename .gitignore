@@ -1,2 +1,8 @@
 *.db
 __pycache__/
+*.pyc
+venv/
+venv_win/
+node_modules/
+dist/
+*.log
