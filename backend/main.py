@@ -298,28 +298,28 @@ async def process_contour_upload(file: UploadFile) -> ContourAnalysisResponse:
         raise HTTPException(status_code=500, detail=f'Analysis failed: {str(e)}')
 
 @app.post('/analyzeContour', response_model=ContourAnalysisResponse)
-async def analyze_contour_route_1(file: UploadFile = File(...)):
-    return await process_contour_upload(file)
+async def analyze_contour_route_1(contour_map: UploadFile = File(...)):
+    return await process_contour_upload(contour_map)
 
 @app.get('/analyzeContour')
 def get_analyze_contour_info():
     return analyze_sample_contour()
 
 @app.post('/findCatchment', response_model=ContourAnalysisResponse)
-async def find_catchment_route_1(file: UploadFile = File(...)):
-    return await process_contour_upload(file)
+async def find_catchment_route_1(contour_map: UploadFile = File(...)):
+    return await process_contour_upload(contour_map)
 
 @app.get('/findCatchment')
 def get_find_catchment_info():
     return analyze_sample_contour()
 
 @app.post('/api/analyzeContour', response_model=ContourAnalysisResponse)
-async def analyze_contour_route_api(file: UploadFile = File(...)):
-    return await process_contour_upload(file)
+async def analyze_contour_route_api(contour_map: UploadFile = File(...)):
+    return await process_contour_upload(contour_map)
 
 @app.post('/api/findCatchment', response_model=ContourAnalysisResponse)
-async def find_catchment_route_api(file: UploadFile = File(...)):
-    return await process_contour_upload(file)
+async def find_catchment_route_api(contour_map: UploadFile = File(...)):
+    return await process_contour_upload(contour_map)
 
 @app.get('/api/sampleContour', response_model=ContourAnalysisResponse)
 def analyze_sample_contour():

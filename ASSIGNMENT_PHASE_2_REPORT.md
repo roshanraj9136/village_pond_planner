@@ -27,10 +27,13 @@ The backend service is engineered using Python and FastAPI for high-performance 
 *   **OpenAPI Schema (JSON):** `http://10.1.75.53:3297/openapi.json`
 
 ### 2.2 Expected Input & cURL Example
-The route accepts `multipart/form-data` with the key `file` containing any valid `.kml` or `.kmz` contour map.
+The route accepts `multipart/form-data` with the key `contour_map` containing any valid `.kml` or `.kmz` contour map.
 
 ```bash
-curl -X POST "http://10.1.75.53:3297/analyzeContour"      -H "accept: application/json"      -H "Content-Type: multipart/form-data"      -F "file=@contours_1m.kml"
+curl -X POST "http://10.1.75.53:3297/analyzeContour" \
+     -H "accept: application/json" \
+     -H "Content-Type: multipart/form-data" \
+     -F "contour_map=@contours_1m.kml"
 ```
 
 ---
@@ -165,7 +168,7 @@ To verify generalized robustness:
 *   **HTTP Method:** `POST`
 *   **Route Path:** `/analyzeContour` or `/findCatchment`
 *   **Content-Type:** `multipart/form-data`
-*   **Form Parameter:** `file` (Binary stream of `.kml` or `.kmz`)
+*   **Form Parameter:** `contour_map` (Binary stream of `.kml` or `.kmz`)
 
 ### 6.2 Response Data Dictionary
 *   `status` (`string`): Execution state (`success` or `error`).
