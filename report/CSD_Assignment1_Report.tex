@@ -16,6 +16,11 @@
 \setcopyright{none}
 \settopmatter{printacmref=false}
 \renewcommand\footnotetextcopyrightpermission[1]{}
+%% acmart's own "not an ACM publication" switch: also drops the
+%% "Manuscript submitted to ACM" footer. Layout is unchanged.
+\makeatletter
+\@ACM@nonacmtrue
+\makeatother
 % \setcopyright{acmlicensed}
 % \acmConference[CSD Assignment 1]{Course: Computer Science and Design}{2026}{Your Institute}
 % \acmISBN{}
