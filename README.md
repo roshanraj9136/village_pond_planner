@@ -12,6 +12,8 @@ feeds it, and the water it can collect in an average year, all drawn on the map.
 | System status (live workers, cache, latency) | http://10.1.75.53:3297/status |
 | Phase 2 route | `POST http://10.1.75.53:3297/analyzeContour` (alias `/findCatchment`) |
 | Sample contour map | http://10.1.75.53:3297/api/sample/contour_map |
+| Demo video | https://youtu.be/Q3VEN3Mh6os |
+| Report (LaTeX source, ACM template) | [`report/`](report/) |
 
 CS559 Computer Systems Design, Assignment 1 (Phases 2 and 3). Roshan Raj, 12341830.
 
@@ -153,6 +155,7 @@ frontend/   React + Leaflet app (Vite)
 deploy/     bootstrap_host.sh, pondctl.sh (start/stop services), deploy.sh (rolling deploy),
             loadtest.py
 docs/       architecture and pipeline diagrams
+report/     final report (LaTeX, ACM template) and its figures
 sample_data/contours_1m.kml
 ```
 
