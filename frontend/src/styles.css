@@ -75,7 +75,9 @@ h3 {
   display: grid;
   grid-template-columns: var(--panel-w) 1fr;
   height: 100%;
-  overflow: hidden; /* the phone panel slides out with a transform; keep it from growing the page */
+  /* clip, not hidden: the phone panel slides out with a transform, and a hidden-overflow box can
+     still be scrolled by focus changes or scrollIntoView, which would shift the whole layout */
+  overflow: clip;
 }
 
 .panel {
