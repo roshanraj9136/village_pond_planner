@@ -11,7 +11,11 @@
 
 %% This is a COURSE ASSIGNMENT report, not an ACM publication, so the
 %% rights-management / DOI / ISBN block from the original ACM sample
-%% is not required.
+%% is not required. acmart still prints its defaults (an ACM copyright
+%% notice and a placeholder DOI), so they are switched off here.
+\setcopyright{none}
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
 % \setcopyright{acmlicensed}
 % \acmConference[CSD Assignment 1]{Course: Computer Science and Design}{2026}{Your Institute}
 % \acmISBN{}
