@@ -52,8 +52,8 @@ export default function StatusPage() {
           </p>
           <div className="metric-row">
             <div><span>{fmt(g.rps_1m, 1)}</span>requests / s (last minute)</div>
-            <div><span>{fmt(data.latency_ms.p50)} ms</span>median analysis time</div>
-            <div><span>{fmt(data.latency_ms.p95)} ms</span>95th percentile</div>
+            <div><span>{fmt(data.latency_ms.p50)} ms</span>median API response</div>
+            <div><span>{fmt(data.latency_ms.p95)} ms</span>95th percentile response</div>
             <div><span>{fmt(data.cache.hit_rate, 1)}%</span>answered from cache</div>
             <div><span>{fmt(g.queue_waiting)}</span>requests waiting</div>
           </div>
