@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 300" width="980" height="300" font-family="Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+  <title id="t">How a pond site is computed</title>
+  <desc id="d">Eight steps: build an elevation grid, fill pits with Priority-Flood, compute D8 flow directions, accumulate upstream area, choose the pond site inside the selected land, trace its catchment, estimate runoff with the SCS curve number method on ten years of daily rain, and size the pond.</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 10 5 0 10Z" fill="#6aaee8"/>
+    </marker>
+  </defs>
+  <rect width="980" height="300" rx="14" fill="#f6f8f4"/>
+  <g font-size="12.2" fill="#3e4a63">
+    <!-- row 1 -->
+    <g>
+      <circle cx="44" cy="52" r="15" fill="#fff" stroke="#1766b5" stroke-width="1.8"/><text x="44" y="57" text-anchor="middle" font-weight="700" font-size="13" fill="#1766b5">1</text>
+      <text x="68" y="48" font-size="14" font-weight="700" fill="#14213d">Elevation grid</text>
+      <text x="68" y="68">30 m satellite DEM window,</text><text x="68" y="84">or TIN from contour lines</text>
+    </g>
+    <line x1="238" y1="52" x2="262" y2="52" stroke="#6aaee8" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <circle cx="286" cy="52" r="15" fill="#fff" stroke="#1766b5" stroke-width="1.8"/><text x="286" y="57" text-anchor="middle" font-weight="700" font-size="13" fill="#1766b5">2</text>
+      <text x="310" y="48" font-size="14" font-weight="700" fill="#14213d">Fill pits</text>
+      <text x="310" y="68">Priority-Flood + ε raises</text><text x="310" y="84">every hollow so it can spill</text>
+    </g>
+    <line x1="480" y1="52" x2="504" y2="52" stroke="#6aaee8" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <circle cx="528" cy="52" r="15" fill="#fff" stroke="#1766b5" stroke-width="1.8"/><text x="528" y="57" text-anchor="middle" font-weight="700" font-size="13" fill="#1766b5">3</text>
+      <text x="552" y="48" font-size="14" font-weight="700" fill="#14213d">D8 flow</text>
+      <text x="552" y="68">each cell drains to its</text><text x="552" y="84">steepest of 8 neighbours</text>
+    </g>
+    <line x1="722" y1="52" x2="746" y2="52" stroke="#6aaee8" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <circle cx="770" cy="52" r="15" fill="#fff" stroke="#1766b5" stroke-width="1.8"/><text x="770" y="57" text-anchor="middle" font-weight="700" font-size="13" fill="#1766b5">4</text>
+      <text x="794" y="48" font-size="14" font-weight="700" fill="#14213d">Accumulate</text>
+      <text x="794" y="68">high-to-low sweep adds up</text><text x="794" y="84">the land draining through</text>
+    </g>
+    <path d="M770 104 V136 H44 V160" fill="none" stroke="#6aaee8" stroke-width="2" marker-end="url(#a)"/>
+    <!-- row 2 -->
+    <g>
+      <circle cx="44" cy="180" r="15" fill="#1766b5"/><text x="44" y="185" text-anchor="middle" font-weight="700" font-size="13" fill="#fff">5</text>
+      <text x="68" y="176" font-size="14" font-weight="700" fill="#14213d">Pond site</text>
+      <text x="68" y="196">max accumulation inside</text><text x="68" y="212">the land you selected</text>
+    </g>
+    <line x1="238" y1="180" x2="262" y2="180" stroke="#6aaee8" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <circle cx="286" cy="180" r="15" fill="#fff" stroke="#1766b5" stroke-width="1.8"/><text x="286" y="185" text-anchor="middle" font-weight="700" font-size="13" fill="#1766b5">6</text>
+      <text x="310" y="176" font-size="14" font-weight="700" fill="#14213d">Catchment</text>
+      <text x="310" y="196">all cells whose flow path</text><text x="310" y="212">passes the site; window</text><text x="310" y="228">widens until it fits</text>
+    </g>
+    <line x1="480" y1="180" x2="504" y2="180" stroke="#6aaee8" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <circle cx="528" cy="180" r="15" fill="#fff" stroke="#1766b5" stroke-width="1.8"/><text x="528" y="185" text-anchor="middle" font-weight="700" font-size="13" fill="#1766b5">7</text>
+      <text x="552" y="176" font-size="14" font-weight="700" fill="#14213d">Water</text>
+      <text x="552" y="196">SCS-CN runoff on 10 years</text><text x="552" y="212">of daily rain (ERA5) ×</text><text x="552" y="228">catchment area</text>
+    </g>
+    <line x1="722" y1="180" x2="746" y2="180" stroke="#6aaee8" stroke-width="2" marker-end="url(#a)"/>
+    <g>
+      <circle cx="770" cy="180" r="15" fill="#fff" stroke="#1766b5" stroke-width="1.8"/><text x="770" y="185" text-anchor="middle" font-weight="700" font-size="13" fill="#1766b5">8</text>
+      <text x="794" y="176" font-size="14" font-weight="700" fill="#14213d">Pond size</text>
+      <text x="794" y="196">1.5 : 1 sloped basin that</text><text x="794" y="212">holds the yearly runoff,</text><text x="794" y="228">≤ 60 % of land, ≤ 5 ha</text>
+    </g>
+  </g>
+  <text x="44" y="276" font-size="12.5" fill="#677086">Collected water = min(yearly runoff, pond capacity). Every step works on the grid; nothing is specific to one map.</text>
+</svg>

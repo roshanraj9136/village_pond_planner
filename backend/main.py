@@ -1,334 +1,465 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import requests
+"""JalDrishti worker: pond site, catchment and water-volume analysis API.
+
+One worker process runs per system (each system has a single CPU). The Go gateway on
+sys1 load-balances across the workers; see ../gateway and ../README.md.
+
+Endpoints
+  POST /api/analyze            land parcel (GeoJSON Polygon) -> analysis on satellite DEM
+  POST /api/analyze/contour    contour map (KML/KMZ) [+ optional parcel] -> analysis
+  GET  /api/sample             analysis of the bundled sample contour map
+  GET  /api/sample/contour_map the sample KML itself
+  GET  /api/coverage           satellite DEM tiles already cached on this worker
+  GET  /api/rainfall           rainfall / runoff summary for a point
+  GET|POST|DELETE /api/sites   saved sites (shared PostgreSQL)
+  GET  /api/health             liveness + load for the gateway
+  POST /analyzeContour, /findCatchment   Phase 2 contract (multipart field ``contour_map``)
+"""
+from __future__ import annotations
+
+import hashlib
+import json
 import math
-import sqlite3
-import cv2
-import numpy as np
 import os
-from typing import List, Dict, Any, Optional
-from contour_analyzer import ContourAnalysisEngine
+import threading
+import time
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Optional
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
-def init_db():
-    conn = sqlite3.connect('ponds.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS reports
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  lat REAL, lng REAL, display_name TEXT,
-                  catchment_area REAL, pond_depth REAL,
-                  storage_capacity REAL, vegetation REAL, water REAL)''')
-    conn.commit()
-    conn.close()
+import planner
+from contours import ContourError, contour_interval, contour_layer, contours_to_grid, parse_contours, read_kml_bytes
+from dem import DemStore, TileUnavailable
+from geo import GeometryError, parse_polygon
+from rainfall import RainfallService, water_budget
+from sites import SitesUnavailable, SiteStore
 
-init_db()
+BASE = Path(__file__).resolve().parent
+DATA = Path(os.environ.get("POND_DATA", str(Path.home() / "pond-data")))
+SAMPLE_KML = Path(os.environ.get("SAMPLE_KML", str(BASE.parent / "sample_data" / "contours_1m.kml")))
+WORKER = os.environ.get("WORKER_NAME", os.uname().nodename if hasattr(os, "uname") else "local")
+VERSION = os.environ.get("APP_VERSION", "dev")
+STARTED = time.time()
 
-class Coordinates(BaseModel):
-    lat: float
-    lng: float
+dem_store = DemStore(DATA / "dem")
+rain = RainfallService(DATA / "rain")
+site_store = SiteStore(os.environ.get("PG_DSN"))
 
-class LocationResponse(BaseModel):
-    display_name: str
-    land_type: str
-    is_suitable: bool
-    warning_message: str
+# One CPU per system: run one analysis at a time, queue at most a couple, shed the rest
+# quickly with 503 so the gateway can place the request on an idle worker instead.
+COMPUTE = threading.Semaphore(1)
+QUEUE_WAIT_S = float(os.environ.get("QUEUE_WAIT_S", "20"))
+_stats_lock = threading.Lock()
+stats = {"inflight": 0, "served": 0, "rejected": 0, "errors": 0}
 
-class RainfallResponse(BaseModel):
-    annual_rainfall_mm: float
-    average_monthly_mm: float
+# Flow models of recently used contour maps, keyed by file hash (parcel-independent work).
+_flow_cache: OrderedDict[str, tuple] = OrderedDict()
+_flow_lock = threading.Lock()
 
-class TerrainRequest(BaseModel):
-    lat: float
-    lng: float
-    annual_rainfall_mm: float
+@asynccontextmanager
+async def lifespan(_app):
+    """Parse the sample map once in the background so the first demo request is instant."""
+    def warm():
+        try:
+            if SAMPLE_KML.exists():
+                _contour_flow(SAMPLE_KML.read_bytes(), SAMPLE_KML.name)
+        except Exception:  # noqa: BLE001 - warming is best effort
+            pass
+    threading.Thread(target=warm, daemon=True).start()
+    yield
 
-class TerrainResponse(BaseModel):
-    elevation_meters: float
-    catchment_area_sq_meters: float
-    estimated_runoff_volume_cubic_meters: float
-    recommended_pond_depth_meters: float
-    estimated_storage_capacity: float
-    runoff_coefficient: float
-    annual_rainfall_mm: float
 
-@app.get('/')
-def read_root():
-    return {'status': 'ok'}
+app = FastAPI(
+    lifespan=lifespan,
+    title="JalDrishti - Village Pond Planner API",
+    version=VERSION,
+    description="Suggests a pond location inside a selected land parcel, delineates its catchment and "
+                "estimates the water that can be collected. CS559 Assignment 1 (IIT Bhilai).",
+)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "DELETE"], allow_headers=["*"])
 
-@app.post('/api/analyze/location', response_model=LocationResponse)
-def analyze_location(coords: Coordinates):
-    url = f'https://nominatim.openstreetmap.org/reverse?format=json&lat={coords.lat}&lon={coords.lng}&zoom=18&addressdetails=1&accept-language=en'
-    headers = {'User-Agent': 'VillagePondPlanner/1.0'}
+
+@app.middleware("http")
+async def tag_worker(request: Request, call_next):
+    t = time.perf_counter()
+    response = await call_next(request)
+    response.headers["X-Worker"] = WORKER
+    response.headers["Server-Timing"] = f"app;dur={(time.perf_counter() - t) * 1e3:.1f}"
+    return response
+
+
+class Busy(Exception):
+    pass
+
+
+def _malloc_trim():
+    """Hand freed heap back to the OS after each analysis (glibc keeps it otherwise), so a
+    worker's resident memory returns to baseline between requests on a 512 MiB container."""
     try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            display_name = data.get('display_name', 'Unknown Area')
-            cls = data.get('class', '')
-            ltype = data.get('type', '')
-            address = data.get('address', {})
-            country_code = address.get('country_code', '')
-            is_suitable = True
-            warning = ''
-            if country_code != 'in':
-                is_suitable = False
-                warning = 'Location must be within India.'
-            else:
-                unsuitable = ['building', 'residential', 'commercial', 'industrial', 'aeroway', 'highway', 'railway', 'military']
-                if cls in unsuitable or ltype in unsuitable:
-                    is_suitable = False
-                    warning = f"Selected location is in a restricted or built-up area ({ltype or cls})."
-            raw_land_type = (ltype or cls or 'open_land').title()
-            final_land_type = raw_land_type if not is_suitable else f'{raw_land_type} (Available for Project)'
-            return LocationResponse(display_name=display_name, land_type=final_land_type, is_suitable=is_suitable, warning_message=warning)
-    except Exception:
-        pass
-    return LocationResponse(display_name=f'Lat: {coords.lat}, Lng: {coords.lng}', land_type='Unknown', is_suitable=True, warning_message='')
+        import ctypes
 
-class LegalResponse(BaseModel):
-    owner_type: str
-    clearance_status: str
-    hurdles: str
+        libc = ctypes.CDLL("libc.so.6")
+        return lambda: libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        return lambda: None
 
-@app.post('/api/analyze/legal', response_model=LegalResponse)
-def analyze_legal(coords: Coordinates):
-    return LegalResponse(owner_type='Gram Panchayat Land', clearance_status='Clear', hurdles='None detected')
 
-@app.post('/api/analyze/rainfall', response_model=RainfallResponse)
-def analyze_rainfall(coords: Coordinates):
-    url = f'https://archive-api.open-meteo.com/v1/archive?latitude={coords.lat}&longitude={coords.lng}&start_date=2023-01-01&end_date=2023-12-31&daily=precipitation_sum&timezone=auto'
+malloc_trim = _malloc_trim()
+
+
+class compute_slot:
+    def __enter__(self):
+        with _stats_lock:
+            stats["inflight"] += 1
+        if not COMPUTE.acquire(timeout=QUEUE_WAIT_S):
+            with _stats_lock:
+                stats["inflight"] -= 1
+                stats["rejected"] += 1
+            raise Busy()
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        COMPUTE.release()
+        malloc_trim()
+        with _stats_lock:
+            stats["inflight"] -= 1
+            stats["served"] += 1
+            if exc_type is not None and exc_type not in (GeometryError, ContourError):
+                stats["errors"] += 1
+        return False
+
+
+def _error(status: int, message: str, headers: dict | None = None) -> JSONResponse:
+    return JSONResponse({"status": "error", "detail": message}, status_code=status, headers=headers)
+
+
+@app.exception_handler(Busy)
+async def _busy(_, __):
+    return _error(503, "All analysis slots on this worker are busy; retry shortly.", {"Retry-After": "2", "X-Worker-Busy": "1"})
+
+
+@app.exception_handler(GeometryError)
+async def _geom(_, exc):
+    return _error(422, str(exc))
+
+
+@app.exception_handler(ContourError)
+async def _contour(_, exc):
+    return _error(422, str(exc))
+
+
+@app.exception_handler(TileUnavailable)
+async def _tile(_, exc):
+    return _error(502, str(exc))
+
+
+# ------------------------------------------------------------------ models
+
+class AnalyzeRequest(BaseModel):
+    area: dict = Field(..., description="Land parcel as a GeoJSON Polygon (or Feature), coordinates [lng, lat].")
+    pond_depth_m: float = Field(3.0, ge=1.0, le=8.0, description="Design pond depth (m).")
+    curve_number: float = Field(80.0, ge=40, le=98, description="SCS runoff curve number for the catchment's land cover.")
+    side_slope: float = Field(1.5, ge=0.5, le=4.0, description="Pond side slope, horizontal : vertical.")
+    max_pond_area_m2: float = Field(50_000, ge=500, le=500_000, description="Largest single pond to suggest (m2).")
+
+
+class SiteIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    lat: float = Field(..., ge=-85, le=85)
+    lng: float = Field(..., ge=-180, le=180)
+    source_type: str = Field(..., max_length=32)
+    parcel_ha: Optional[float] = Field(None, ge=0, le=1e6)
+    catchment_ha: float = Field(..., ge=0, le=1e7)
+    runoff_m3: float = Field(..., ge=0, le=1e10)
+    capacity_m3: float = Field(..., ge=0, le=1e10)
+    collectable_m3: float = Field(..., ge=0, le=1e10)
+    pond_area_m2: float = Field(..., ge=0, le=1e9)
+    depth_m: float = Field(..., ge=0, le=20)
+    area_geojson: Optional[dict] = None
+
+
+def _params(pond_depth_m: float, curve_number: float, side_slope: float,
+            max_pond_area_m2: float = 50_000) -> planner.Params:
+    return planner.Params(pond_depth_m=pond_depth_m, curve_number=curve_number, side_slope=side_slope,
+                          max_pond_area_m2=max_pond_area_m2).validated()
+
+
+def _finish(result: dict, t0: float) -> dict:
+    result["served_by"] = WORKER
+    result["version"] = VERSION
+    result["timings_ms"]["total"] = round((time.perf_counter() - t0) * 1e3, 1)
+    return result
+
+
+# ------------------------------------------------------------------ core analyses
+
+def analyze_parcel(area: dict, params: planner.Params) -> dict:
+    t0 = time.perf_counter()
+    ring = parse_polygon(area)
+    info = planner.validate_parcel(ring)
+    with compute_slot():
+        hydro, meta = planner.dem_hydrology(dem_store, ring, info)
+        result = planner.build_result(hydro, ring, info, params, rain)
+    result["analysis_window"] = meta
+    return _finish(result, t0)
+
+
+def _contour_flow(data: bytes, filename: str):
+    key = hashlib.sha256(data).hexdigest()
+    with _flow_lock:
+        hit = _flow_cache.get(key)
+        if hit:
+            _flow_cache.move_to_end(key)
+            return hit + (True,)
+    lines = parse_contours(read_kml_bytes(data, filename))
+    grid = contours_to_grid(lines)
+    fm = planner.flow_model(grid)
+    meta = contour_metadata(lines, filename)
+    layer = {"type": "FeatureCollection", "features": contour_layer(lines)}
+    entry = (fm, meta, layer)
+    with _flow_lock:
+        _flow_cache[key] = entry
+        while len(_flow_cache) > 6:
+            _flow_cache.popitem(last=False)
+    return entry + (False,)
+
+
+def contour_metadata(lines, filename: str) -> dict:
+    pts = np.vstack([ln.coords for ln in lines])
+    elevs = [ln.elev for ln in lines]
+    return {
+        "filename": filename,
+        "total_contour_lines": len(lines),
+        "total_vertices": int(pts.shape[0]),
+        "elevation_min_m": round(min(elevs), 2),
+        "elevation_max_m": round(max(elevs), 2),
+        "contour_interval_m": contour_interval(lines),
+        "bounding_box": {"min_lat": float(pts[:, 1].min()), "max_lat": float(pts[:, 1].max()),
+                         "min_lng": float(pts[:, 0].min()), "max_lng": float(pts[:, 0].max())},
+    }
+
+
+def analyze_contour(data: bytes, filename: str, area: dict | None, params: planner.Params) -> dict:
+    t0 = time.perf_counter()
+    ring = parse_polygon(area) if area else None
+    info = planner.validate_parcel(ring) if ring else None
+    with compute_slot():
+        fm, meta, layer, cached = _contour_flow(data, filename)
+        hydro = planner.select_site(fm, ring)
+        if cached:
+            hydro.ms = {k: 0.0 for k in ("fill", "flow")} | {k: v for k, v in hydro.ms.items() if k not in ("fill", "flow")}
+        result = planner.build_result(hydro, ring, info, params, rain,
+                                      extra_layers={"contours": layer, "contour_interval_m": meta["contour_interval_m"]})
+    result["contour_map"] = meta
+    result["source"] = {**result["source"], "name": f"Contour map: {filename}", "flow_model_cached": cached}
+    return _finish(result, t0)
+
+
+def legacy_response(result: dict) -> dict:
+    """Phase 2 response contract (same keys as before) plus the full Phase 3 analysis."""
+    meta = result["contour_map"]
+    return {
+        "status": "success",
+        "message": "Terrain analysed with Priority-Flood depression filling and D8 flow accumulation.",
+        "contour_metadata": {
+            "total_contour_lines": meta["total_contour_lines"],
+            "elevation_min_meters": meta["elevation_min_m"],
+            "elevation_max_meters": meta["elevation_max_m"],
+            "elevation_range_meters": round(meta["elevation_max_m"] - meta["elevation_min_m"], 2),
+            "contour_interval_meters": meta["contour_interval_m"],
+            "bounding_box": meta["bounding_box"],
+        },
+        "terrain_metrics": {
+            "average_slope_percent": result["catchment"]["mean_slope_pct"],
+            "terrain_classification": result["catchment"]["terrain"],
+            "runoff_coefficient": result["water"]["runoff_coefficient"],
+            "annual_rainfall_mm": result["water"]["annual_rainfall_mm"],
+        },
+        "pond_location": {
+            "latitude": result["pond"]["lat"],
+            "longitude": result["pond"]["lng"],
+            "elevation_meters": result["pond"]["elevation_m"],
+            "site_suitability": "Maximum flow accumulation point",
+        },
+        "catchment_analysis": {
+            "catchment_area_sq_meters": result["catchment"]["area_m2"],
+            "catchment_area_hectares": result["catchment"]["area_ha"],
+            "estimated_runoff_volume_cubic_meters": result["water"]["harvestable_runoff_m3"],
+            "recommended_pond_surface_area_sq_meters": result["pond"]["surface_area_m2"],
+            "recommended_pond_depth_meters": result["pond"]["depth_m"],
+            "estimated_storage_capacity_cubic_meters": result["pond"]["storage_capacity_m3"],
+            "expected_collectable_volume_cubic_meters": result["water"]["collectable_volume_m3"],
+            "boundary_geojson": result["catchment"]["geojson"],
+        },
+        "analysis": result,
+    }
+
+
+def _read_sample() -> bytes:
+    if not SAMPLE_KML.exists():
+        raise HTTPException(404, "Sample contour map is not installed on this worker.")
+    return SAMPLE_KML.read_bytes()
+
+
+def _parse_area_field(area: Optional[str]) -> dict | None:
+    if area is None or not area.strip():
+        return None
     try:
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        daily = data.get('daily', {}).get('precipitation_sum', [])
-        valid = [p for p in daily if p is not None]
-        total_annual = sum(valid)
-        return RainfallResponse(annual_rainfall_mm=round(total_annual, 2), average_monthly_mm=round(total_annual / 12, 2))
-    except Exception:
-        return RainfallResponse(annual_rainfall_mm=850.0, average_monthly_mm=70.8)
+        return json.loads(area)
+    except ValueError as exc:
+        raise GeometryError("The 'area' field must be GeoJSON text.") from exc
 
-@app.post('/api/analyze/terrain', response_model=TerrainResponse)
-def analyze_terrain(req: TerrainRequest):
-    offset = 0.00045
-    lats = f'{req.lat},{req.lat + offset},{req.lat - offset},{req.lat},{req.lat}'
-    lngs = f'{req.lng},{req.lng},{req.lng},{req.lng + offset},{req.lng - offset}'
-    elevation_url = f'https://api.open-meteo.com/v1/elevation?latitude={lats}&longitude={lngs}'
-    try:
-        elev_response = requests.get(elevation_url, timeout=10)
-        elevations = elev_response.json().get('elevation', [200.0, 200.0, 200.0, 200.0, 200.0])
-    except Exception:
-        elevations = [200.0, 200.0, 200.0, 200.0, 200.0]
-    center_elev, north_elev, south_elev, east_elev, west_elev = elevations[0], elevations[1], elevations[2], elevations[3], elevations[4]
-    dz_dx = (east_elev - west_elev) / 100.0
-    dz_dy = (north_elev - south_elev) / 100.0
-    slope_percent = math.sqrt(dz_dx ** 2 + dz_dy ** 2) * 100.0
-    rainfall_meters = req.annual_rainfall_mm / 1000.0
-    if slope_percent < 2.0:
-        catchment_area_sqm = 500000.0
-        runoff_coefficient = 0.2
-    elif slope_percent < 7.0:
-        catchment_area_sqm = 250000.0
-        runoff_coefficient = 0.35
-    elif slope_percent < 15.0:
-        catchment_area_sqm = 100000.0
-        runoff_coefficient = 0.5
+
+async def _read_upload(upload: UploadFile) -> tuple[bytes, str]:
+    name = upload.filename or "contour_map.kml"
+    if Path(name).suffix.lower() not in (".kml", ".kmz"):
+        raise HTTPException(400, f"Unsupported file type '{Path(name).suffix}'. Upload a .kml or .kmz contour map.")
+    data = await upload.read()
+    if not data:
+        raise HTTPException(400, "The uploaded file is empty.")
+    return data, name
+
+
+# ------------------------------------------------------------------ routes
+
+@app.get("/api/health", tags=["system"])
+async def health():
+    with _stats_lock:
+        s = dict(stats)
+    return {"status": "ok", "worker": WORKER, "version": VERSION, "uptime_s": round(time.time() - STARTED), **s}
+
+
+@app.post("/api/analyze", tags=["analysis"], summary="Analyse a land parcel on satellite elevation data")
+def api_analyze(req: AnalyzeRequest):
+    return analyze_parcel(req.area, _params(req.pond_depth_m, req.curve_number, req.side_slope, req.max_pond_area_m2))
+
+
+@app.post("/api/analyze/contour", tags=["analysis"], summary="Analyse a contour map, optionally within a land parcel")
+async def api_analyze_contour(
+    contour_map: Optional[UploadFile] = File(None, description="KML or KMZ contour map"),
+    use_sample: bool = Form(False, description="Use the bundled contours_1m.kml instead of an upload"),
+    area: Optional[str] = Form(None, description="Optional land parcel as GeoJSON Polygon text"),
+    pond_depth_m: float = Form(3.0, ge=1.0, le=8.0),
+    curve_number: float = Form(80.0, ge=40, le=98),
+    side_slope: float = Form(1.5, ge=0.5, le=4.0),
+    max_pond_area_m2: float = Form(50_000, ge=500, le=500_000),
+):
+    if contour_map is not None and contour_map.filename:
+        data, name = await _read_upload(contour_map)
+    elif use_sample:
+        data, name = _read_sample(), SAMPLE_KML.name
     else:
-        catchment_area_sqm = 50000.0
-        runoff_coefficient = 0.65
-    runoff_volume = runoff_coefficient * rainfall_meters * catchment_area_sqm
-    pond_surface_area = catchment_area_sqm * 0.1
-    active_depth = runoff_volume / pond_surface_area
-    calculated_depth = 2.0 + active_depth
-    recommended_depth = round(max(2.0, min(5.5, calculated_depth)), 2)
-    storage_capacity = pond_surface_area * recommended_depth
-    return TerrainResponse(
-        elevation_meters=round(center_elev, 1),
-        catchment_area_sq_meters=round(catchment_area_sqm, 2),
-        estimated_runoff_volume_cubic_meters=round(runoff_volume, 2),
-        recommended_pond_depth_meters=recommended_depth,
-        estimated_storage_capacity=round(storage_capacity, 2),
-        runoff_coefficient=runoff_coefficient,
-        annual_rainfall_mm=round(req.annual_rainfall_mm, 2)
-    )
+        raise HTTPException(400, "Upload a contour map in the 'contour_map' field or set use_sample=true.")
+    return await run_in_threadpool(analyze_contour, data, name, _parse_area_field(area),
+                                   _params(pond_depth_m, curve_number, side_slope, max_pond_area_m2))
 
-class VisionResponse(BaseModel):
-    vegetation_percentage: float
-    water_body_percentage: float
-    message: str
 
-def deg2num(lat_deg, lon_deg, zoom):
-    lat_rad = math.radians(lat_deg)
-    n = 2.0 ** zoom
-    xtile = int((lon_deg + 180.0) / 360.0 * n)
-    ytile = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
-    return xtile, ytile
+@app.get("/api/sample", tags=["analysis"], summary="Analysis of the bundled sample contour map")
+def api_sample(pond_depth_m: float = Query(3.0, ge=1.0, le=8.0), curve_number: float = Query(80.0, ge=40, le=98)):
+    return analyze_contour(_read_sample(), SAMPLE_KML.name, None, _params(pond_depth_m, curve_number, 1.5))
 
-@app.post('/api/analyze/vision', response_model=VisionResponse)
-def analyze_vision(coords: Coordinates):
+
+@app.get("/api/sample/contour_map", tags=["analysis"], summary="Download the sample contour map (KML)")
+def api_sample_file():
+    if not SAMPLE_KML.exists():
+        raise HTTPException(404, "Sample contour map is not installed on this worker.")
+    return FileResponse(SAMPLE_KML, media_type="application/vnd.google-earth.kml+xml", filename=SAMPLE_KML.name)
+
+
+@app.get("/api/coverage", tags=["system"], summary="Satellite DEM tiles cached on this worker")
+def api_coverage():
+    return {"worker": WORKER, "tiles": dem_store.coverage(),
+            "note": "Areas outside these tiles work too; their tile is downloaded on first use (~40 MB)."}
+
+
+@app.get("/api/rainfall", tags=["analysis"], summary="Rainfall and runoff depth at a point")
+def api_rainfall(lat: float = Query(..., ge=-85, le=85), lng: float = Query(..., ge=-180, le=180),
+                 curve_number: float = Query(80.0, ge=40, le=98)):
+    return {"lat": lat, "lng": lng, **water_budget(rain.series(lat, lng), curve_number)}
+
+
+@app.get("/api/sites", tags=["sites"])
+def list_sites():
     try:
-        z = 16
-        x, y = deg2num(coords.lat, coords.lng, z)
-        tile_url = f'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-        headers = {'User-Agent': 'VillagePondPlanner/1.0'}
-        resp = requests.get(tile_url, headers=headers, timeout=5)
-        if resp.status_code == 200:
-            nparr = np.frombuffer(resp.content, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is not None:
-                hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-                lower_green = np.array([30, 40, 40])
-                upper_green = np.array([85, 255, 255])
-                mask_green = cv2.inRange(hsv, lower_green, upper_green)
-                veg_pixels = cv2.countNonZero(mask_green)
-                lower_water = np.array([90, 40, 40])
-                upper_water = np.array([130, 255, 255])
-                mask_water = cv2.inRange(hsv, lower_water, upper_water)
-                water_pixels = cv2.countNonZero(mask_water)
-                total_pixels = img.shape[0] * img.shape[1]
-                veg_percent = round(veg_pixels / total_pixels * 100, 2)
-                water_percent = round(water_pixels / total_pixels * 100, 2)
-                return VisionResponse(vegetation_percentage=veg_percent, water_body_percentage=water_percent, message='success')
-    except Exception:
-        pass
-    return VisionResponse(vegetation_percentage=0.0, water_body_percentage=0.0, message='failed')
+        return {"sites": site_store.list()}
+    except SitesUnavailable as exc:
+        return _error(503, str(exc))
 
-class Report(BaseModel):
-    lat: float
-    lng: float
-    display_name: str
-    catchment_area: float
-    pond_depth: float
-    storage_capacity: float
-    vegetation: float
-    water: float
 
-class SavedReport(Report):
-    id: int
-
-@app.post('/api/reports')
-def save_report(report: Report):
-    conn = sqlite3.connect('ponds.db')
-    c = conn.cursor()
-    c.execute('''INSERT INTO reports (lat, lng, display_name, catchment_area, pond_depth, storage_capacity, vegetation, water)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)''', 
-              (report.lat, report.lng, report.display_name, report.catchment_area, report.pond_depth, report.storage_capacity, report.vegetation, report.water))
-    conn.commit()
-    conn.close()
-    return {'message': 'Report saved'}
-
-@app.get('/api/reports', response_model=List[SavedReport])
-def get_reports():
-    conn = sqlite3.connect('ponds.db')
-    c = conn.cursor()
-    c.execute('SELECT id, lat, lng, display_name, catchment_area, pond_depth, storage_capacity, vegetation, water FROM reports')
-    rows = c.fetchall()
-    conn.close()
-    return [{'id': r[0], 'lat': r[1], 'lng': r[2], 'display_name': r[3], 'catchment_area': r[4], 'pond_depth': r[5], 'storage_capacity': r[6], 'vegetation': r[7], 'water': r[8]} for r in rows]
-
-@app.delete('/api/reports/{report_id}')
-def delete_report(report_id: int):
-    conn = sqlite3.connect('ponds.db')
-    c = conn.cursor()
-    c.execute('DELETE FROM reports WHERE id = ?', (report_id,))
-    conn.commit()
-    conn.close()
-    return {'message': 'Report deleted'}
-
-class BoundingBox(BaseModel):
-    min_lat: float
-    max_lat: float
-    min_lng: float
-    max_lng: float
-
-class ContourMetadata(BaseModel):
-    total_contour_lines: int
-    elevation_min_meters: float
-    elevation_max_meters: float
-    elevation_range_meters: float
-    contour_interval_meters: float
-    bounding_box: BoundingBox
-
-class TerrainMetrics(BaseModel):
-    average_slope_percent: float
-    terrain_classification: str
-    runoff_coefficient: float
-    annual_rainfall_mm: float
-
-class PondLocation(BaseModel):
-    latitude: float
-    longitude: float
-    elevation_meters: float
-    site_suitability: str
-
-class CatchmentAnalysis(BaseModel):
-    catchment_area_sq_meters: float
-    catchment_area_hectares: float
-    estimated_runoff_volume_cubic_meters: float
-    recommended_pond_surface_area_sq_meters: float
-    recommended_pond_depth_meters: float
-    estimated_storage_capacity_cubic_meters: float
-    boundary_geojson: Optional[Dict[str, Any]] = None
-
-class ContourAnalysisResponse(BaseModel):
-    status: str
-    message: str
-    contour_metadata: ContourMetadata
-    terrain_metrics: TerrainMetrics
-    pond_location: PondLocation
-    catchment_analysis: CatchmentAnalysis
-
-async def process_contour_upload(file: UploadFile) -> ContourAnalysisResponse:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail='Missing filename.')
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in ['.kml', '.kmz']:
-        raise HTTPException(status_code=400, detail=f"Unsupported format '{ext}'. Must be .kml or .kmz")
+@app.post("/api/sites", tags=["sites"], status_code=201)
+def add_site(site: SiteIn):
+    data = site.model_dump()
+    if data.get("area_geojson"):
+        parse_polygon(data["area_geojson"])  # reject malformed geometry
+    for k in ("lat", "lng", "catchment_ha", "runoff_m3", "capacity_m3", "collectable_m3", "pond_area_m2", "depth_m"):
+        if not math.isfinite(data[k]):
+            raise GeometryError(f"{k} must be a finite number.")
     try:
-        content = await file.read()
-        kml_text = ContourAnalysisEngine.extract_kml_from_bytes(content, file.filename)
-        contours = ContourAnalysisEngine.parse_contours_from_kml(kml_text)
-        result = ContourAnalysisEngine.analyze_terrain(contours)
-        return ContourAnalysisResponse(**result)
-    except ValueError as ve:
-        raise HTTPException(status_code=422, detail=str(ve))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f'Analysis failed: {str(e)}')
+        return {"status": "saved", **site_store.add(data)}
+    except SitesUnavailable as exc:
+        return _error(503, str(exc))
 
-@app.post('/analyzeContour', response_model=ContourAnalysisResponse)
-async def analyze_contour_route_1(contour_map: UploadFile = File(...)):
-    return await process_contour_upload(contour_map)
 
-@app.get('/analyzeContour')
-def get_analyze_contour_info():
-    return analyze_sample_contour()
+@app.delete("/api/sites/{site_id}", tags=["sites"])
+def delete_site(site_id: int):
+    try:
+        if not site_store.delete(site_id):
+            raise HTTPException(404, "No such site.")
+        return {"status": "deleted", "id": site_id}
+    except SitesUnavailable as exc:
+        return _error(503, str(exc))
 
-@app.post('/findCatchment', response_model=ContourAnalysisResponse)
-async def find_catchment_route_1(contour_map: UploadFile = File(...)):
-    return await process_contour_upload(contour_map)
 
-@app.get('/findCatchment')
-def get_find_catchment_info():
-    return analyze_sample_contour()
+# ---- Phase 2 contract ------------------------------------------------------------
 
-@app.post('/api/analyzeContour', response_model=ContourAnalysisResponse)
-async def analyze_contour_route_api(contour_map: UploadFile = File(...)):
-    return await process_contour_upload(contour_map)
+async def _phase2(contour_map: UploadFile, area: Optional[str]) -> dict:
+    data, name = await _read_upload(contour_map)
+    result = await run_in_threadpool(analyze_contour, data, name, _parse_area_field(area), planner.Params())
+    return legacy_response(result)
 
-@app.post('/api/findCatchment', response_model=ContourAnalysisResponse)
-async def find_catchment_route_api(contour_map: UploadFile = File(...)):
-    return await process_contour_upload(contour_map)
 
-@app.get('/api/sampleContour', response_model=ContourAnalysisResponse)
-def analyze_sample_contour():
-    sample_path = os.path.join(os.path.dirname(__file__), '..', 'sample_data', 'contours_1m.kml')
-    if not os.path.exists(sample_path):
-        raise HTTPException(status_code=404, detail='Sample file not found.')
-    with open(sample_path, 'rb') as f:
-        content = f.read()
-    kml_text = ContourAnalysisEngine.extract_kml_from_bytes(content, 'contours_1m.kml')
-    contours = ContourAnalysisEngine.parse_contours_from_kml(kml_text)
-    result = ContourAnalysisEngine.analyze_terrain(contours)
-    return ContourAnalysisResponse(**result)
+PHASE2_DOC = ("Phase 2 route. multipart/form-data with the contour map in field `contour_map` "
+              "(.kml or .kmz); optional `area` (GeoJSON Polygon text) restricts the pond to a parcel.")
+
+
+@app.post("/analyzeContour", tags=["phase 2"], summary="Analyse a contour map (Phase 2 contract)", description=PHASE2_DOC)
+async def analyze_contour_route(contour_map: UploadFile = File(...), area: Optional[str] = Form(None)):
+    return await _phase2(contour_map, area)
+
+
+@app.post("/findCatchment", tags=["phase 2"], summary="Alias of /analyzeContour", description=PHASE2_DOC)
+async def find_catchment_route(contour_map: UploadFile = File(...), area: Optional[str] = Form(None)):
+    return await _phase2(contour_map, area)
+
+
+@app.post("/api/analyzeContour", include_in_schema=False)
+async def analyze_contour_api_alias(contour_map: UploadFile = File(...), area: Optional[str] = Form(None)):
+    return await _phase2(contour_map, area)
+
+
+@app.post("/api/findCatchment", include_in_schema=False)
+async def find_catchment_api_alias(contour_map: UploadFile = File(...), area: Optional[str] = Form(None)):
+    return await _phase2(contour_map, area)
+
+
+@app.get("/analyzeContour", tags=["phase 2"], summary="Sample contour map result in the Phase 2 format")
+def analyze_contour_sample():
+    return legacy_response(analyze_contour(_read_sample(), SAMPLE_KML.name, None, planner.Params()))
+
+
+@app.get("/findCatchment", include_in_schema=False)
+def find_catchment_sample():
+    return analyze_contour_sample()
+
+
+@app.get("/api/sampleContour", include_in_schema=False)
+def sample_contour_alias():
+    return analyze_contour_sample()
