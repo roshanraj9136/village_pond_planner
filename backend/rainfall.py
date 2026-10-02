@@ -16,15 +16,17 @@ previous five days of rain), which is what makes a wet monsoon week run off.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import threading
 import time
 import urllib.parse
-import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
+
+import netfetch
 
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 START, END = "2015-01-01", "2024-12-31"
@@ -87,9 +89,9 @@ class RainfallService:
             "latitude": f"{lat:.4f}", "longitude": f"{lng:.4f}", "start_date": START, "end_date": END,
             "daily": "precipitation_sum", "timezone": "Asia/Kolkata",
         })
-        req = urllib.request.Request(f"{ARCHIVE_URL}?{q}", headers={"User-Agent": "JalDrishti/3.0 (IIT Bhilai CS559)"})
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            with netfetch.get(f"{ARCHIVE_URL}?{q}", headers={"User-Agent": "JalDrishti/3.0 (IIT Bhilai CS559)"},
+                              read_timeout=self.timeout_s, deadline_s=self.timeout_s + 8) as resp:
                 raw = json.loads(resp.read())
             daily = raw.get("daily") or {}
             times = daily.get("time") or []
@@ -97,7 +99,7 @@ class RainfallService:
             if len(times) < 3000 or len(times) != len(precip):
                 return None
             return {"time": times, "precip": precip, "grid_lat": raw.get("latitude"), "grid_lng": raw.get("longitude")}
-        except (OSError, ValueError):
+        except (OSError, ValueError, http.client.HTTPException):
             return None
 
 

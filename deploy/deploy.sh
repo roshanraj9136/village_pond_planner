@@ -38,12 +38,22 @@ find "$ROOT/frontend/dist" -type f \( -name '*.js' -o -name '*.css' -o -name '*.
 for port in "${WORKER_SSH[@]}"; do
   say "syncing code on :$port ($SYNC)"
   if [ "$SYNC" = git ]; then
-    remote "$port" 'git -C ~/village_pond_planner pull --ff-only --quiet && git -C ~/village_pond_planner log -1 --format="%h %s"'
+    if ! remote "$port" 'timeout 45 git -C ~/village_pond_planner pull --ff-only --quiet'; then
+      # the lab's internet is unreliable: send the commits over the SSH connection instead
+      echo "  GitHub unreachable from the lab; sending the commits over SSH"
+      git -C "$ROOT" bundle create - main 2>/dev/null | remote "$port" \
+        'cat >/tmp/jd.bundle && git -C ~/village_pond_planner fetch -q /tmp/jd.bundle main &&
+         git -C ~/village_pond_planner merge -q --ff-only FETCH_HEAD; rc=$?; rm -f /tmp/jd.bundle; exit $rc'
+    fi
+    remote "$port" 'git -C ~/village_pond_planner log -1 --format="%h %s"'
   else
     tar -C "$ROOT" --exclude='__pycache__' --exclude='.pytest_cache' --exclude='venv*' --exclude='*.db' \
       -czf - backend deploy gateway sample_data | remote "$port" 'tar -xzf - -C ~/village_pond_planner'
   fi
-  remote "$port" '~/pondenv/bin/pip install -q --no-cache-dir --retries 10 -r ~/village_pond_planner/backend/requirements.txt'
+  # only touch PyPI when requirements.txt changed (the lab's internet is unreliable)
+  remote "$port" 'req=~/village_pond_planner/backend/requirements.txt; h=$(sha256sum $req | cut -c1-64)
+    [ "$(cat ~/pondenv/.req-hash 2>/dev/null)" = "$h" ] ||
+      { ~/pondenv/bin/pip install -q --no-cache-dir --retries 10 -r $req && echo "$h" >~/pondenv/.req-hash; }'
 done
 
 say "uploading frontend and building gateway on sys1"

@@ -22,13 +22,12 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
 
+import netfetch
 from geo import GeometryError
 from hydrology import Grid
 
@@ -181,14 +180,14 @@ def _fetch(lat_floor: int, lng_floor: int, root: Path) -> None:
             return
         if not raw.exists():
             name = tile_remote_name(lat_floor, lng_floor)
-            req = urllib.request.Request(BUCKET_URL.format(name=name), headers={"User-Agent": "JalDrishti/3.0"})
             part = raw.with_suffix(".part")
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp, open(part, "wb") as fh:
+                with netfetch.get(BUCKET_URL.format(name=name), headers={"User-Agent": "JalDrishti/3.0"},
+                                  read_timeout=60, deadline_s=90) as resp, open(part, "wb") as fh:
                     while chunk := resp.read(1 << 20):
                         fh.write(chunk)
-            except urllib.error.HTTPError as exc:
-                if exc.code in (403, 404):  # no tile = ocean
+            except netfetch.HTTPStatusError as exc:
+                if exc.status in (403, 404):  # no tile = ocean
                     none.write_text(time.strftime("%Y-%m-%d"))
                     return
                 raise
@@ -226,7 +225,14 @@ def main(argv: list[str]) -> int:
     (root / "tiles").mkdir(parents=True, exist_ok=True)
     (root / "raw").mkdir(parents=True, exist_ok=True)
     if args.cmd == "fetch":
-        _fetch(args.lat, args.lng, root)
+        for attempt in range(3):  # a transfer cut off midway is retried from the start
+            try:
+                _fetch(args.lat, args.lng, root)
+                break
+            except OSError:
+                if attempt == 2:
+                    raise
+                time.sleep(2)
     elif args.cmd == "region":
         for lat in range(args.lat_min, args.lat_max + 1):
             for lng in range(args.lng_min, args.lng_max + 1):
