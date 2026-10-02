@@ -3,7 +3,8 @@
 Rainfall: Open-Meteo historical archive (ERA5 reanalysis), daily totals for the ten
 complete years 2015-2024 at the site. Responses are cached per 0.1 degree cell in
 memory and on disk, so the external API is called at most once per cell per worker;
-a failed call is remembered for a minute so an outage does not stall every request.
+a failed call is remembered for a minute so an outage does not stall every request, and
+no request waits longer than MAX_WAIT_S for a download.
 
 Runoff: USDA SCS Curve Number method applied to every rain day,
     S  = 25400 / CN - 254          (potential retention, mm)
@@ -24,6 +25,7 @@ import threading
 import time
 import urllib.parse
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +37,10 @@ START, END = "2015-01-01", "2024-12-31"
 FALLBACK_ANNUAL_MM = 1150.0   # long-term normal for the Durg / Raipur plains (IMD)
 FALLBACK_RUNOFF_COEFF = 0.25
 NEARBY_KM = 20.0              # farthest cached cell that may stand in for an unreachable one
-QUICK_DEADLINE_S = 6.0        # download budget when such a stand-in exists
+QUICK_DEADLINE_S = 6.0        # longest wait for a download when such a stand-in exists
+MAX_WAIT_S = 15.0             # longest wait when there is none (then: regional normal)
+
+_DOWNLOADS = ThreadPoolExecutor(max_workers=4, thread_name_prefix="rainfall")
 
 
 class RainfallService:
@@ -45,6 +50,7 @@ class RainfallService:
         self.timeout_s = timeout_s
         self._mem: OrderedDict[str, dict] = OrderedDict()
         self._fail_until: dict[str, float] = {}
+        self._inflight: dict[str, Future] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
 
@@ -77,14 +83,18 @@ class RainfallService:
                 near = self._nearest_cached(clat, clng)
                 if self._fail_until.get(key, 0) > time.time():
                     return near
-                # with a neighbouring record to fall back on, do not keep the user waiting long
-                data = self._download(clat, clng, deadline_s=QUICK_DEADLINE_S if near else None)
-                if data is None:
-                    self._fail_until[key] = time.time() + 60
+                fut = self._inflight.get(key)
+                if fut is None or fut.done():  # join a download still running for this cell
+                    fut = self._inflight[key] = _DOWNLOADS.submit(self._fetch_to_disk, clat, clng, key, path)
+                # A hard cap on the wait (DNS and slow reads are not bounded by the connect
+                # timeout), shorter when a neighbouring record can stand in. A download that
+                # overruns keeps going in the background and fills the cache for next time.
+                try:
+                    data = fut.result(timeout=QUICK_DEADLINE_S if near else MAX_WAIT_S)
+                except Exception:  # noqa: BLE001 - wait timed out, or the download raised
                     return near
-                tmp = path.with_suffix(".tmp")
-                tmp.write_text(json.dumps(data))
-                tmp.replace(path)
+                if data is None:
+                    return near
             self._mem[key] = data
             while len(self._mem) > 256:
                 self._mem.popitem(last=False)
@@ -111,15 +121,24 @@ class RainfallService:
             return None
         return {**data, "nearby_km": round(best_km, 1)}
 
-    def _download(self, lat: float, lng: float, deadline_s: float | None = None) -> dict | None:
-        deadline_s = deadline_s or self.timeout_s + 8
+    def _fetch_to_disk(self, lat: float, lng: float, key: str, path: Path) -> dict | None:
+        data = self._download(lat, lng)
+        if data is None:
+            self._fail_until[key] = time.time() + 60
+            return None
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(path)
+        return data
+
+    def _download(self, lat: float, lng: float) -> dict | None:
         q = urllib.parse.urlencode({
             "latitude": f"{lat:.4f}", "longitude": f"{lng:.4f}", "start_date": START, "end_date": END,
             "daily": "precipitation_sum", "timezone": "Asia/Kolkata",
         })
         try:
             with netfetch.get(f"{ARCHIVE_URL}?{q}", headers={"User-Agent": "JalDrishti/3.0 (IIT Bhilai CS559)"},
-                              read_timeout=min(self.timeout_s, deadline_s), deadline_s=deadline_s) as resp:
+                              read_timeout=self.timeout_s, deadline_s=self.timeout_s + 8) as resp:
                 raw = json.loads(resp.read())
             daily = raw.get("daily") or {}
             times = daily.get("time") or []
