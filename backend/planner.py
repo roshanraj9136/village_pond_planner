@@ -353,6 +353,9 @@ def build_result(hydro: Hydro, ring, parcel_info: dict | None, params: Params, r
                      f"usable depth is {usable_depth:.2f} m.")
     if budget["is_fallback"]:
         notes.append("Live rainfall data was unreachable; a regional normal was used.")
+    elif budget.get("nearby_km"):
+        notes.append(f"Rainfall for this exact spot could not be downloaded just now; the record of the nearest "
+                     f"saved cell ({budget['nearby_km']:g} km away) was used.")
 
     reason = ("Highest flow accumulation inside the selected land: water from "
               f"{catch_m2 / 1e4:,.2f} ha of land drains to this point")

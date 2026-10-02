@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
+import sys
 import threading
 import time
 import urllib.parse
@@ -32,6 +34,7 @@ ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 START, END = "2015-01-01", "2024-12-31"
 FALLBACK_ANNUAL_MM = 1150.0   # long-term normal for the Durg / Raipur plains (IMD)
 FALLBACK_RUNOFF_COEFF = 0.25
+NEARBY_KM = 20.0              # farthest cached cell that may stand in for an unreachable one
 
 
 class RainfallService:
@@ -71,11 +74,11 @@ class RainfallService:
                     data = None
             if data is None:
                 if self._fail_until.get(key, 0) > time.time():
-                    return None
+                    return self._nearest_cached(clat, clng)
                 data = self._download(clat, clng)
                 if data is None:
                     self._fail_until[key] = time.time() + 60
-                    return None
+                    return self._nearest_cached(clat, clng)
                 tmp = path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(data))
                 tmp.replace(path)
@@ -83,6 +86,27 @@ class RainfallService:
             while len(self._mem) > 256:
                 self._mem.popitem(last=False)
             return data
+
+    def _nearest_cached(self, lat: float, lng: float) -> dict | None:
+        """When the archive cannot be reached, the closest cell already on disk stands in if it
+        is within NEARBY_KM: ERA5 itself resolves rainfall at about 30 km, so a neighbouring
+        cell is a far better estimate than the flat regional normal. Marked with `nearby_km`."""
+        best, best_km = None, NEARBY_KM
+        for path in self.cache_dir.glob("*.json"):
+            try:
+                plat, plng = (float(v) for v in path.stem.split("_"))
+            except ValueError:
+                continue
+            km = 111.2 * math.hypot(plat - lat, (plng - lng) * math.cos(math.radians(lat)))
+            if km <= best_km:
+                best, best_km = path, km
+        if best is None:
+            return None
+        try:
+            data = json.loads(best.read_text())
+        except (OSError, ValueError):
+            return None
+        return {**data, "nearby_km": round(best_km, 1)}
 
     def _download(self, lat: float, lng: float) -> dict | None:
         q = urllib.parse.urlencode({
@@ -165,6 +189,44 @@ def water_budget(series: dict | None, cn: float) -> dict:
         "period": f"{yearly[0]['year']}-{yearly[-1]['year']}",
         "method": f"SCS Curve Number (CN {cn:g}, antecedent-moisture adjusted) on daily rainfall, "
                   f"averaged over {n_years} years",
-        "rainfall_source": "Open-Meteo historical archive (ERA5 reanalysis)",
+        "rainfall_source": "Open-Meteo historical archive (ERA5 reanalysis)"
+                           + (f", nearest saved cell {series['nearby_km']:g} km away" if series.get("nearby_km") else ""),
+        "nearby_km": series.get("nearby_km"),
         "is_fallback": False,
     }
+
+
+def prefetch(root: str, lat_min: float, lat_max: float, lng_min: float, lng_max: float, pause_s: float) -> int:
+    """Fill the cache for every 0.1 degree cell in a box (run where the internet is reliable,
+    then copy the files to each worker's rain directory). Stops when the archive keeps refusing."""
+    svc = RainfallService(root)
+    cells = [(round(la / 10, 1), round(lo / 10, 1))
+             for la in range(round(lat_min * 10), round(lat_max * 10) + 1)
+             for lo in range(round(lng_min * 10), round(lng_max * 10) + 1)]
+    fetched = misses = 0
+    for lat, lng in cells:
+        if (svc.cache_dir / f"{svc.cell(lat, lng)[2]}.json").exists():
+            continue
+        data = svc._download(lat, lng)
+        if data is None:
+            misses += 1
+            print("failed", lat, lng, flush=True)
+            if misses >= 5:
+                print("stopping: the archive keeps refusing (rate limit?)", flush=True)
+                break
+        else:
+            misses = 0
+            fetched += 1
+            path = svc.cache_dir / f"{svc.cell(lat, lng)[2]}.json"
+            path.write_text(json.dumps(data))
+        time.sleep(pause_s)
+    print(f"fetched {fetched}; {len(list(svc.cache_dir.glob('*.json')))} cells cached in {root}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    # python rainfall.py prefetch LAT_MIN LAT_MAX LNG_MIN LNG_MAX ROOT [PAUSE_S]
+    if len(sys.argv) >= 7 and sys.argv[1] == "prefetch":
+        a = sys.argv[2:]
+        sys.exit(prefetch(a[4], float(a[0]), float(a[1]), float(a[2]), float(a[3]), float(a[5]) if len(a) > 5 else 1.0))
+    print(__doc__)
