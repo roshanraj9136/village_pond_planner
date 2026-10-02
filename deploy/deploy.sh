@@ -18,7 +18,17 @@ GATEWAY_SSH=2297
 WORKER_SSH=(2297 2298 2299 2300)
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
-remote() { local port=$1; shift; ssh -i "$JD_KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=10 "student@$JD_HOST" "$@"; }
+# The campus path to the lab host drops some new TCP connections, so retry the connect
+# (ssh exits 255 when it cannot connect; any other code is the remote command's own).
+remote() {
+  local port=$1 rc; shift
+  for attempt in 1 2 3 4 5 6 7 8; do
+    rc=0
+    ssh -i "$JD_KEY" -p "$port" -o BatchMode=yes -o ConnectTimeout=4 "student@$JD_HOST" "$@" || rc=$?
+    [ "$rc" -ne 255 ] && return "$rc"
+  done
+  return 255
+}
 say() { printf '\n== %s\n' "$*"; }
 
 say "building frontend"
@@ -47,7 +57,9 @@ remote "$GATEWAY_SSH" 'cd ~/village_pond_planner/gateway && export GOPATH=~/tool
 
 for port in "${WORKER_SSH[@]}"; do
   say "restarting worker on :$port"
-  remote "$port" 'bash ~/village_pond_planner/deploy/pondctl.sh restart worker >/dev/null
+  remote "$port" 'bash ~/village_pond_planner/deploy/pondctl.sh install-hook >/dev/null
+    bash ~/village_pond_planner/deploy/pondctl.sh ensure >/dev/null
+    bash ~/village_pond_planner/deploy/pondctl.sh restart worker >/dev/null
     . ~/pond.env
     for i in $(seq 1 60); do
       if curl -sf -m 2 "http://127.0.0.1:$PORT/api/health" >/dev/null; then echo "$WORKER_NAME healthy after ${i}s"; exit 0; fi
@@ -60,8 +72,8 @@ say "restarting gateway"
 remote "$GATEWAY_SSH" 'bash ~/village_pond_planner/deploy/pondctl.sh restart gateway >/dev/null; sleep 3; tail -1 ~/pond-logs/gateway.log'
 
 say "smoke test $JD_URL"
-for path in / /status /docs /api/health /gateway/status /api/sample/contour_map; do
-  printf '%s %s\n' "$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$JD_URL$path")" "$path"
+for path in / /status /docs /api/health /api/sites /gateway/status /api/sample/contour_map; do
+  printf '%s %s\n' "$(curl -s -o /dev/null -m 15 --connect-timeout 3 --retry 4 --retry-connrefused -w '%{http_code}' "$JD_URL$path")" "$path"
 done
-curl -s -m 60 -o /dev/null -w '%{http_code} POST /analyzeContour (sample)\n' \
+curl -s -m 60 --connect-timeout 3 --retry 4 -o /dev/null -w '%{http_code} POST /analyzeContour (sample)\n' \
   -F "contour_map=@$ROOT/sample_data/contours_1m.kml" "$JD_URL/analyzeContour"

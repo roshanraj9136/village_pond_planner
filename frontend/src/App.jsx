@@ -8,7 +8,16 @@ import { BASES, LAYERS } from './components/mapConfig'
 import Results from './components/Results'
 import HowItWorks from './components/HowItWorks'
 import StatusPage from './components/StatusPage'
-import { analyzeContour, analyzeParcel, coverage as fetchCoverage, deleteSite, listSites, saveSite, searchPlace } from './lib/api'
+import {
+  analyzeContour,
+  analyzeParcel,
+  coverage as fetchCoverage,
+  deleteSite,
+  keepConnectionWarm,
+  listSites,
+  saveSite,
+  searchPlace,
+} from './lib/api'
 import { acres, boundsOf, fmt, fmtArea, ringArea, toPolygon } from './lib/format'
 
 const REPO = 'https://github.com/roshanraj9136/village_pond_planner'
@@ -74,6 +83,8 @@ function Planner() {
       .then(({ body }) => setTiles(body.tiles || []))
       .catch(() => setTiles([]))
   }, [refreshSites])
+
+  useEffect(() => keepConnectionWarm(), [])
 
   useEffect(() => {
     if (!toast) return undefined

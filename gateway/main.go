@@ -355,6 +355,16 @@ type Gateway struct {
 	metrics      *Metrics
 	version      string
 	writeLimiter *Limiter
+	sitesWorker  *Worker // runs next to PostgreSQL; the only worker that can serve /api/sites
+}
+
+// pinned returns the worker that must serve r, or nil when any worker may. Saved sites
+// live in a database only reachable from the worker on the same system.
+func (g *Gateway) pinned(r *http.Request) *Worker {
+	if g.sitesWorker != nil && strings.HasPrefix(r.URL.Path, "/api/sites") {
+		return g.sitesWorker
+	}
+	return nil
 }
 
 var cacheable = map[string]bool{
@@ -445,6 +455,11 @@ func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusTooManyRequests, "Too many changes from this address; wait a few seconds.")
 		return
 	}
+	if p := g.pinned(r); p != nil && !p.alive.Load() {
+		w.Header().Set("Retry-After", "5")
+		errJSON(w, http.StatusServiceUnavailable, "Saved sites are unavailable right now. Analysis still works.")
+		return
+	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, g.maxBody))
 	if err != nil {
 		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("Request body is larger than %d MB.", g.maxBody>>20))
@@ -492,8 +507,15 @@ func (g *Gateway) forward(parent context.Context, r *http.Request, body []byte) 
 	ctx, cancel := context.WithTimeout(parent, g.queueTimeout+g.client.Timeout)
 	defer cancel()
 	avoid := map[*Worker]bool{}
+	attempts := len(g.pool.workers)
+	if only := g.pinned(r); only != nil {
+		for _, wk := range g.pool.workers {
+			avoid[wk] = wk != only
+		}
+		attempts = 1
+	}
 	var lastErr error
-	for attempt := 0; attempt < len(g.pool.workers); attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		qctx, qcancel := context.WithTimeout(ctx, g.queueTimeout)
 		wk, err := g.pool.acquire(qctx, avoid)
 		qcancel()
@@ -676,6 +698,10 @@ func (g *Gateway) status(w http.ResponseWriter) {
 		rows = append(rows, ws{wk.Name, wk.URL, wk.alive.Load(), wk.inflight.Load(), wk.served.Load(), wk.failures.Load(),
 			wk.busy503.Load(), round1(float64frombits(wk.ewmaMs.Load())), v, round1(ago)})
 	}
+	sitesName := ""
+	if g.sitesWorker != nil {
+		sitesName = g.sitesWorker.Name
+	}
 	rps, p50, p95, p99, n := g.metrics.snapshot()
 	g.cache.mu.Lock()
 	entries, bytesUsed := len(g.cache.items), g.cache.bytes
@@ -692,6 +718,7 @@ func (g *Gateway) status(w http.ResponseWriter) {
 			"rps_1m": round1(rps), "status_2xx": g.metrics.status2xx.Load(), "status_4xx": g.metrics.status4xx.Load(),
 			"status_5xx": g.metrics.status5xx.Load(), "shed_503": g.metrics.shed.Load(), "retries": g.metrics.retries.Load(),
 			"queue_waiting": g.pool.waiting.Load(), "queue_limit": g.pool.maxWait, "slots_per_worker": g.pool.slots,
+			"sites_worker": sitesName,
 		},
 		"latency_ms": map[string]any{"p50": round1(p50), "p95": round1(p95), "p99": round1(p99), "samples": n},
 		"cache": map[string]any{"entries": entries, "bytes": bytesUsed, "max_bytes": g.cache.maxBytes,
@@ -752,15 +779,24 @@ func main() {
 	cacheTTL := flag.Duration("cache-ttl", 6*time.Hour, "response cache lifetime")
 	maxBodyMB := flag.Int64("max-body-mb", 26, "largest request body (contour uploads)")
 	version := flag.String("version", "dev", "build identifier shown in /gateway/status")
+	sitesFlag := flag.String("sites-worker", "", "worker that runs next to PostgreSQL and serves /api/sites (empty: any worker)")
 	flag.Parse()
 
 	var workers []*Worker
+	var sitesWorker *Worker
 	for _, part := range strings.Split(*workersFlag, ",") {
 		name, url, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if !ok {
 			log.Fatalf("bad -workers entry %q (want name=url)", part)
 		}
-		workers = append(workers, &Worker{Name: name, URL: strings.TrimRight(url, "/")})
+		wk := &Worker{Name: name, URL: strings.TrimRight(url, "/")}
+		workers = append(workers, wk)
+		if name == *sitesFlag {
+			sitesWorker = wk
+		}
+	}
+	if *sitesFlag != "" && sitesWorker == nil {
+		log.Fatalf("-sites-worker %q is not in -workers", *sitesFlag)
 	}
 	transport := &http.Transport{
 		DialContext:         (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -781,13 +817,16 @@ func main() {
 		metrics:      &Metrics{start: time.Now()},
 		version:      *version,
 		writeLimiter: &Limiter{buckets: map[string]*bucket{}, rate: 0.5, burst: 20},
+		sitesWorker:  sitesWorker,
 	}
 	srv := &http.Server{
 		Handler:           g,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      *upstreamTimeout + *queueTimeout + 30*time.Second,
-		IdleTimeout:       90 * time.Second,
+		// Long keep-alive: the campus path to the lab host drops some *new* TCP connections,
+		// so browsers should keep reusing one that already works (Chrome holds idle ones 5 min).
+		IdleTimeout:       10 * time.Minute,
 		MaxHeaderBytes:    1 << 16,
 	}
 	go func() {
