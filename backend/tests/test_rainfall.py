@@ -1,6 +1,7 @@
 """Rainfall cache behaviour when the archive is unreachable (no network used)."""
 import json
 
+import rainfall
 from rainfall import RainfallService, water_budget
 
 
@@ -10,7 +11,8 @@ def _series(mm_per_day: float) -> dict:
 
 
 def _offline(svc):
-    svc._download = lambda lat, lng: None
+    svc.deadlines = []
+    svc._download = lambda lat, lng, deadline_s=None: svc.deadlines.append(deadline_s)
 
 
 def test_unreachable_uses_nearest_saved_cell(tmp_path):
@@ -23,6 +25,8 @@ def test_unreachable_uses_nearest_saved_cell(tmp_path):
     assert budget["is_fallback"] is False
     assert budget["nearby_km"] == s["nearby_km"]
     assert "km away" in budget["rainfall_source"]
+    # a stand-in existed, so the live download got the short budget
+    assert svc.deadlines == [rainfall.QUICK_DEADLINE_S]
     # the stand-in must not be remembered as the cell's own record
     assert not (tmp_path / "+21.3_+81.3.json").exists()
 
@@ -33,6 +37,7 @@ def test_unreachable_and_nothing_nearby_uses_regional_normal(tmp_path):
     _offline(svc)
     s = svc.series(22.5, 82.5)  # ~190 km away
     assert s is None
+    assert svc.deadlines == [None]  # nothing to fall back on: the full download budget
     assert water_budget(s, 80)["is_fallback"] is True
 
 

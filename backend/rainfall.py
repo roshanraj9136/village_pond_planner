@@ -35,6 +35,7 @@ START, END = "2015-01-01", "2024-12-31"
 FALLBACK_ANNUAL_MM = 1150.0   # long-term normal for the Durg / Raipur plains (IMD)
 FALLBACK_RUNOFF_COEFF = 0.25
 NEARBY_KM = 20.0              # farthest cached cell that may stand in for an unreachable one
+QUICK_DEADLINE_S = 6.0        # download budget when such a stand-in exists
 
 
 class RainfallService:
@@ -73,12 +74,14 @@ class RainfallService:
                 except (OSError, ValueError):
                     data = None
             if data is None:
+                near = self._nearest_cached(clat, clng)
                 if self._fail_until.get(key, 0) > time.time():
-                    return self._nearest_cached(clat, clng)
-                data = self._download(clat, clng)
+                    return near
+                # with a neighbouring record to fall back on, do not keep the user waiting long
+                data = self._download(clat, clng, deadline_s=QUICK_DEADLINE_S if near else None)
                 if data is None:
                     self._fail_until[key] = time.time() + 60
-                    return self._nearest_cached(clat, clng)
+                    return near
                 tmp = path.with_suffix(".tmp")
                 tmp.write_text(json.dumps(data))
                 tmp.replace(path)
@@ -108,14 +111,15 @@ class RainfallService:
             return None
         return {**data, "nearby_km": round(best_km, 1)}
 
-    def _download(self, lat: float, lng: float) -> dict | None:
+    def _download(self, lat: float, lng: float, deadline_s: float | None = None) -> dict | None:
+        deadline_s = deadline_s or self.timeout_s + 8
         q = urllib.parse.urlencode({
             "latitude": f"{lat:.4f}", "longitude": f"{lng:.4f}", "start_date": START, "end_date": END,
             "daily": "precipitation_sum", "timezone": "Asia/Kolkata",
         })
         try:
             with netfetch.get(f"{ARCHIVE_URL}?{q}", headers={"User-Agent": "JalDrishti/3.0 (IIT Bhilai CS559)"},
-                              read_timeout=self.timeout_s, deadline_s=self.timeout_s + 8) as resp:
+                              read_timeout=min(self.timeout_s, deadline_s), deadline_s=deadline_s) as resp:
                 raw = json.loads(resp.read())
             daily = raw.get("daily") or {}
             times = daily.get("time") or []
