@@ -88,8 +88,9 @@ forwards to port 3000 on sys1. Everything therefore enters through one gateway.
   The sys1 worker runs at `nice 10` so the gateway always gets the CPU first. DEM tiles are
   memory-mapped, rainfall is cached per 0.1° cell (pre-loaded for 20.6–22.0° N, 80.9–82.2° E;
   if the archive cannot be reached a saved cell within 20 km stands in, and no request waits more
-  than 15 s), and parsed contour maps and their flow models are cached by file hash. BLAS threads are pinned to 1, glibc arenas to 2, and freed memory is
-  returned after every analysis, which keeps each worker near 150 MB of the 512 MiB limit.
+  than 15 s), and parsed contour maps and their flow models are cached by file hash. BLAS
+  threads are pinned to 1, glibc arenas to 2, and freed memory is returned after every
+  analysis, which keeps each worker near 150 MB of the 512 MiB limit.
 * **PostgreSQL (sys2)** stores saved sites. Workers are stateless; if the database is down only
   saving is affected. The gateway sends `/api/sites` to the sys2 worker, which reaches it locally.
 * **Only the public URL serves the site.** Workers listen on ports the lab host does not publish.
