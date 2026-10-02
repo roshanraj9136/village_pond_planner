@@ -7,14 +7,16 @@
 #   pondctl.sh install-hook   run `ensure` on every SSH login (see below)
 #   pondctl.sh status
 #
-# Per-host settings live in ~/pond.env (never committed). Container IPs change whenever the
-# lab restarts the containers, so nothing refers to them: each system's worker listens on
-# port 3000, which the lab host publishes as 10.1.75.53:3298 / 3299 / 3300 for sys2 / 3 / 4.
+# Per-host settings live in ~/pond.env (never committed). The site is public only through
+# the gateway (10.1.75.53:3297 -> sys1:3000). Port 3000 on sys2-4 is published by the lab
+# host too (as :3298-3300), so workers must NOT listen there; they use 3298-3300 inside the
+# container instead. Container IPs change whenever the lab restarts the containers, so each
+# worker announces its address to the gateway (GATEWAY_URL + shared REGISTER_KEY).
 #   sys1: WORKER_NAME=sys1 PORT=4297 BIND=127.0.0.1 NICE=10 SERVICES="worker gateway" SITES_WORKER=sys2
-#         GATEWAY_WORKERS=sys1=http://127.0.0.1:4297,sys2=http://10.1.75.53:3298,sys3=...:3299,sys4=...:3300
-#   sys2: WORKER_NAME=sys2 PORT=3000 SERVICES="db worker" PG_PORT=5433 PG_PASSWORD=...
-#         PG_DSN=postgresql://pond:...@127.0.0.1:5433/postgres
-#   sys3, sys4: WORKER_NAME=sys3 PORT=3000 SERVICES=worker
+#         REGISTER_KEY=... GATEWAY_WORKERS=sys1=http://127.0.0.1:4297,sys2=,sys3=,sys4=
+#   sys2: WORKER_NAME=sys2 PORT=3298 SERVICES="db worker" GATEWAY_URL=http://10.1.75.53:3297 REGISTER_KEY=...
+#         PG_PORT=5433 PG_PASSWORD=... PG_DSN=postgresql://pond:...@127.0.0.1:5433/postgres
+#   sys3, sys4: WORKER_NAME=sys3 PORT=3299 SERVICES=worker GATEWAY_URL=... REGISTER_KEY=...
 set -euo pipefail
 
 REPO=${REPO:-$HOME/village_pond_planner}
@@ -55,11 +57,14 @@ worker_loop() {
 
 gateway_loop() {
   load_env
+  mkdir -p "$HOME/pond-state"
   while true; do
-    # public 10.1.75.53:3297 arrives on port 3000 inside sys1; 3297 is kept for internal use
+    # public 10.1.75.53:3297 arrives on port 3000 inside sys1; 3297 is kept for internal use.
+    # REGISTER_KEY reaches the gateway through the environment (load_env exports it).
     GOMEMLIMIT=${GOMEMLIMIT:-150MiB} GOGC=${GOGC:-50} "$BIN/gateway" -addr "${GATEWAY_ADDR:-0.0.0.0:3000,0.0.0.0:3297}" \
       -static "$REPO/frontend/dist" -workers "${GATEWAY_WORKERS:?GATEWAY_WORKERS missing in $ENV_FILE}" \
-      -sites-worker "${SITES_WORKER:-}" -version "$APP_VERSION" >>"$LOGS/gateway.log" 2>&1 || true
+      -sites-worker "${SITES_WORKER:-}" -state "$HOME/pond-state/workers.json" \
+      -version "$APP_VERSION" >>"$LOGS/gateway.log" 2>&1 || true
     echo "$(date -Is) gateway exited; restarting" >>"$LOGS/gateway.log"
     sleep 0.2
   done

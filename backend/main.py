@@ -20,8 +20,11 @@ import hashlib
 import json
 import math
 import os
+import socket
 import threading
 import time
+import urllib.parse
+import urllib.request
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -63,6 +66,30 @@ stats = {"inflight": 0, "served": 0, "rejected": 0, "errors": 0}
 _flow_cache: OrderedDict[str, tuple] = OrderedDict()
 _flow_lock = threading.Lock()
 
+def _register_loop(gateway: str, key: str, port: str) -> None:
+    """Tell the gateway where this worker is, every 10 s.
+
+    Workers listen on a port the lab host does not publish, so only the public gateway
+    URL serves the site. Their container IP changes whenever the lab restarts the
+    containers, and the gateway's public address is the one thing that stays fixed, so
+    each worker reports its current address there (the gateway checks the shared key).
+    """
+    target = urllib.parse.urlsplit(gateway)
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect((target.hostname, target.port or 80))  # no packet sent; picks the outgoing interface
+                ip = s.getsockname()[0]
+            req = urllib.request.Request(
+                gateway.rstrip("/") + "/gateway/register",
+                data=json.dumps({"name": WORKER, "url": f"http://{ip}:{port}"}).encode(),
+                headers={"Content-Type": "application/json", "X-Register-Key": key})
+            urllib.request.urlopen(req, timeout=3).close()
+        except OSError:
+            pass  # gateway restarting or a dropped connection; the next round retries
+        time.sleep(10)
+
+
 @asynccontextmanager
 async def lifespan(_app):
     """Parse the sample map once in the background so the first demo request is instant."""
@@ -73,6 +100,9 @@ async def lifespan(_app):
         except Exception:  # noqa: BLE001 - warming is best effort
             pass
     threading.Thread(target=warm, daemon=True).start()
+    gateway, key = os.environ.get("GATEWAY_URL"), os.environ.get("REGISTER_KEY")
+    if gateway and key and os.environ.get("PORT"):
+        threading.Thread(target=_register_loop, args=(gateway, key, os.environ["PORT"]), daemon=True).start()
     yield
 
 

@@ -79,7 +79,13 @@ for port in "${WORKER_SSH[@]}"; do
 done
 
 say "restarting gateway"
-remote "$GATEWAY_SSH" 'bash ~/village_pond_planner/deploy/pondctl.sh restart gateway >/dev/null; sleep 3; tail -1 ~/pond-logs/gateway.log'
+remote "$GATEWAY_SSH" 'bash ~/village_pond_planner/deploy/pondctl.sh restart gateway >/dev/null
+  for i in $(seq 1 30); do
+    up=$(curl -s -m 3 http://127.0.0.1:3000/gateway/status | grep -o "\"alive\":true" | wc -l)
+    [ "$up" -ge 4 ] && break
+    sleep 1
+  done
+  echo "$up of 4 workers up after ${i}s"'
 
 say "smoke test $JD_URL"
 for path in / /status /docs /api/health /api/sites /gateway/status /api/sample/contour_map; do
@@ -87,3 +93,9 @@ for path in / /status /docs /api/health /api/sites /gateway/status /api/sample/c
 done
 curl -s -m 60 --connect-timeout 3 --retry 4 -o /dev/null -w '%{http_code} POST /analyzeContour (sample)\n' \
   -F "contour_map=@$ROOT/sample_data/contours_1m.kml" "$JD_URL/analyzeContour"
+
+say "checking that only $JD_URL serves the site"
+for port in 3298 3299 3300; do
+  code=$(curl -s -o /dev/null -m 5 --connect-timeout 3 --retry 3 -w '%{http_code}' "http://$JD_HOST:$port/api/health" || true)
+  if [ "$code" = 000 ]; then echo "ok   $JD_HOST:$port serves nothing"; else echo "FAIL $JD_HOST:$port answered $code" >&2; exit 1; fi
+done

@@ -16,6 +16,7 @@ import (
 	"container/list"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
@@ -43,7 +45,7 @@ import (
 
 type Worker struct {
 	Name     string
-	URL      string
+	addr     atomic.Pointer[string] // base URL; workers re-announce it (see register)
 	alive    atomic.Bool
 	inflight atomic.Int64
 	served   atomic.Uint64
@@ -53,6 +55,15 @@ type Worker struct {
 	version  atomic.Value  // string
 	lastSeen atomic.Int64  // unix ms of last good health check
 }
+
+func NewWorker(name, base string) *Worker {
+	w := &Worker{Name: name}
+	w.SetURL(base)
+	return w
+}
+
+func (w *Worker) URL() string        { return *w.addr.Load() }
+func (w *Worker) SetURL(base string) { u := strings.TrimRight(base, "/"); w.addr.Store(&u) }
 
 func float64bits(f float64) uint64     { return math.Float64bits(f) }
 func float64frombits(b uint64) float64 { return math.Float64frombits(b) }
@@ -146,8 +157,12 @@ func (p *Pool) healthLoop(client *http.Client, every time.Duration) {
 	check := func(w *Worker) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, w.URL+"/api/health", nil)
-		resp, err := client.Do(req)
+		var resp *http.Response
+		err := errors.New("address not announced yet")
+		if base := w.URL(); base != "" {
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/health", nil)
+			resp, err = client.Do(req)
+		}
 		ok := err == nil && resp.StatusCode == http.StatusOK
 		if err == nil {
 			var h struct {
@@ -356,6 +371,94 @@ type Gateway struct {
 	version      string
 	writeLimiter *Limiter
 	sitesWorker  *Worker // runs next to PostgreSQL; the only worker that can serve /api/sites
+	registerKey  string  // shared with the workers; empty disables /gateway/register
+	statePath    string  // last announced worker addresses, so a restart does not forget them
+	stateMu      sync.Mutex
+}
+
+// register records a worker's current address. Workers listen only on ports the lab host
+// does not publish, so the public URL is the one way into the site; their container IPs
+// change whenever the lab restarts the containers, so each worker reports its address here.
+func (g *Gateway) register(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || g.registerKey == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Register-Key")), []byte(g.registerKey)) != 1 {
+		errJSON(w, http.StatusForbidden, "wrong register key")
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, "bad JSON")
+		return
+	}
+	u, err := url.Parse(req.URL)
+	if err != nil || u.Scheme != "http" || u.Port() == "" || strings.Trim(u.Path, "/") != "" {
+		errJSON(w, http.StatusBadRequest, "url must look like http://<private ip>:<port>")
+		return
+	}
+	if ip := net.ParseIP(u.Hostname()); ip == nil || !(ip.IsPrivate() || ip.IsLoopback()) {
+		errJSON(w, http.StatusBadRequest, "url must point to a private address")
+		return
+	}
+	var wk *Worker
+	for _, cand := range g.pool.workers {
+		if cand.Name == req.Name {
+			wk = cand
+		}
+	}
+	if wk == nil {
+		errJSON(w, http.StatusNotFound, "unknown worker")
+		return
+	}
+	if base := u.Scheme + "://" + u.Host; wk.URL() != base {
+		log.Printf("worker %s announced address %s (was %q)", wk.Name, base, wk.URL())
+		wk.SetURL(base)
+		g.saveState()
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (g *Gateway) saveState() {
+	if g.statePath == "" {
+		return
+	}
+	g.stateMu.Lock()
+	defer g.stateMu.Unlock()
+	addrs := map[string]string{}
+	for _, wk := range g.pool.workers {
+		addrs[wk.Name] = wk.URL()
+	}
+	data, _ := json.Marshal(addrs)
+	tmp := g.statePath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		log.Printf("saving worker addresses: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, g.statePath); err != nil {
+		log.Printf("saving worker addresses: %v", err)
+	}
+}
+
+// loadState restores announced addresses for workers whose -workers entry is empty.
+func loadState(path string, workers []*Worker) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var addrs map[string]string
+	if json.Unmarshal(data, &addrs) != nil {
+		return
+	}
+	for _, wk := range workers {
+		if wk.URL() == "" && addrs[wk.Name] != "" {
+			wk.SetURL(addrs[wk.Name])
+		}
+	}
 }
 
 // pinned returns the worker that must serve r, or nil when any worker may. Saved sites
@@ -402,6 +505,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.status(rec)
 	case r.URL.Path == "/gateway/health":
 		writeJSON(rec, 200, map[string]any{"status": "ok"})
+	case r.URL.Path == "/gateway/register":
+		g.register(rec, r)
 	case isAPI(r.URL.Path):
 		g.metrics.api.Add(1)
 		g.proxy(rec, r)
@@ -529,7 +634,7 @@ func (g *Gateway) forward(parent context.Context, r *http.Request, body []byte) 
 			g.metrics.retries.Add(1)
 		}
 		t := time.Now()
-		req, _ := http.NewRequestWithContext(ctx, r.Method, wk.URL+r.URL.RequestURI(), bytes.NewReader(body))
+		req, _ := http.NewRequestWithContext(ctx, r.Method, wk.URL()+r.URL.RequestURI(), bytes.NewReader(body))
 		for k, vs := range r.Header {
 			if !hopHeaders[k] && k != "Accept-Encoding" {
 				req.Header[k] = vs
@@ -695,7 +800,7 @@ func (g *Gateway) status(w http.ResponseWriter) {
 		if ls := wk.lastSeen.Load(); ls > 0 {
 			ago = float64(time.Now().UnixMilli()-ls) / 1000
 		}
-		rows = append(rows, ws{wk.Name, wk.URL, wk.alive.Load(), wk.inflight.Load(), wk.served.Load(), wk.failures.Load(),
+		rows = append(rows, ws{wk.Name, wk.URL(), wk.alive.Load(), wk.inflight.Load(), wk.served.Load(), wk.failures.Load(),
 			wk.busy503.Load(), round1(float64frombits(wk.ewmaMs.Load())), v, round1(ago)})
 	}
 	sitesName := ""
@@ -770,7 +875,8 @@ func main() {
 	// The lab host forwards the public 10.1.75.53:3297 to port 3000 inside sys1, so listen on both.
 	addr := flag.String("addr", "0.0.0.0:3000,0.0.0.0:3297", "comma-separated listen addresses")
 	static := flag.String("static", "../frontend/dist", "built frontend directory")
-	workersFlag := flag.String("workers", "sys1=http://127.0.0.1:8001", "comma-separated name=url list")
+	workersFlag := flag.String("workers", "sys1=http://127.0.0.1:8001", "comma-separated name=url list (empty url: the worker announces it)")
+	statePath := flag.String("state", "", "file that keeps announced worker addresses across restarts")
 	slots := flag.Int("slots", 2, "concurrent requests per worker (1 running + 1 queued on a 1-CPU worker)")
 	queueMax := flag.Int("queue", 256, "requests allowed to wait for a slot before shedding with 503")
 	queueTimeout := flag.Duration("queue-timeout", 20*time.Second, "longest wait for a free worker slot")
@@ -785,11 +891,11 @@ func main() {
 	var workers []*Worker
 	var sitesWorker *Worker
 	for _, part := range strings.Split(*workersFlag, ",") {
-		name, url, ok := strings.Cut(strings.TrimSpace(part), "=")
+		name, base, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if !ok {
 			log.Fatalf("bad -workers entry %q (want name=url)", part)
 		}
-		wk := &Worker{Name: name, URL: strings.TrimRight(url, "/")}
+		wk := NewWorker(name, base)
 		workers = append(workers, wk)
 		if name == *sitesFlag {
 			sitesWorker = wk
@@ -797,6 +903,9 @@ func main() {
 	}
 	if *sitesFlag != "" && sitesWorker == nil {
 		log.Fatalf("-sites-worker %q is not in -workers", *sitesFlag)
+	}
+	if *statePath != "" {
+		loadState(*statePath, workers)
 	}
 	transport := &http.Transport{
 		DialContext:         (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -818,6 +927,8 @@ func main() {
 		version:      *version,
 		writeLimiter: &Limiter{buckets: map[string]*bucket{}, rate: 0.5, burst: 20},
 		sitesWorker:  sitesWorker,
+		registerKey:  os.Getenv("REGISTER_KEY"), // from the environment, so it never shows in ps
+		statePath:    *statePath,
 	}
 	srv := &http.Server{
 		Handler:           g,
@@ -826,8 +937,8 @@ func main() {
 		WriteTimeout:      *upstreamTimeout + *queueTimeout + 30*time.Second,
 		// Long keep-alive: the campus path to the lab host drops some *new* TCP connections,
 		// so browsers should keep reusing one that already works (Chrome holds idle ones 5 min).
-		IdleTimeout:       10 * time.Minute,
-		MaxHeaderBytes:    1 << 16,
+		IdleTimeout:    10 * time.Minute,
+		MaxHeaderBytes: 1 << 16,
 	}
 	go func() {
 		sig := make(chan os.Signal, 1)
