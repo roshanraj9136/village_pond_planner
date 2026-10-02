@@ -85,8 +85,9 @@ def _register_loop(gateway: str, key: str, port: str) -> None:
                 data=json.dumps({"name": WORKER, "url": f"http://{ip}:{port}"}).encode(),
                 headers={"Content-Type": "application/json", "X-Register-Key": key})
             urllib.request.urlopen(req, timeout=3).close()
-        except OSError:
-            pass  # gateway restarting or a dropped connection; the next round retries
+        except Exception as exc:  # noqa: BLE001 - this loop must outlive any one failure
+            # usually the gateway restarting or a dropped connection; the next round retries
+            print(f"register with gateway failed: {exc!r}", flush=True)
         time.sleep(10)
 
 
@@ -100,7 +101,7 @@ async def lifespan(_app):
         except Exception:  # noqa: BLE001 - warming is best effort
             pass
     threading.Thread(target=warm, daemon=True).start()
-    gateway, key = os.environ.get("GATEWAY_URL"), os.environ.get("REGISTER_KEY")
+    gateway, key = os.environ.get("GATEWAY_URL"), os.environ.get("REGISTER_KEY", "").strip()
     if gateway and key and os.environ.get("PORT"):
         threading.Thread(target=_register_loop, args=(gateway, key, os.environ["PORT"]), daemon=True).start()
     yield

@@ -927,7 +927,7 @@ func main() {
 		version:      *version,
 		writeLimiter: &Limiter{buckets: map[string]*bucket{}, rate: 0.5, burst: 20},
 		sitesWorker:  sitesWorker,
-		registerKey:  os.Getenv("REGISTER_KEY"), // from the environment, so it never shows in ps
+		registerKey:  strings.TrimSpace(os.Getenv("REGISTER_KEY")), // from the environment, so it never shows in ps
 		statePath:    *statePath,
 	}
 	srv := &http.Server{
