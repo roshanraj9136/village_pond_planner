@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: jaldrishti
+    folder: JalDrishti
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

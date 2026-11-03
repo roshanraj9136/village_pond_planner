@@ -17,8 +17,10 @@ previous five days of rain), which is what makes a wet monsoon week run off.
 """
 from __future__ import annotations
 
+import contextvars
 import http.client
 import json
+import logging
 import math
 import sys
 import threading
@@ -29,8 +31,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+from opentelemetry import trace
 
 import netfetch
+from telemetry import RAIN_LOOKUPS
+
+log = logging.getLogger("jaldrishti.rainfall")
 
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 START, END = "2015-01-01", "2024-12-31"
@@ -68,37 +74,42 @@ class RainfallService:
         clat, clng, key = self.cell(lat, lng)
         if key in self._mem:
             self._mem.move_to_end(key)
-            return self._mem[key]
+            return _seen("memory", key, self._mem[key])
         with self._lock_for(key):  # concurrent requests for one cell share one download
             if key in self._mem:
-                return self._mem[key]
+                return _seen("memory", key, self._mem[key])
             path = self.cache_dir / f"{key}.json"
             data = None
+            source = "disk"
             if path.exists():
                 try:
                     data = json.loads(path.read_text())
                 except (OSError, ValueError):
                     data = None
             if data is None:
+                source = "download"
                 near = self._nearest_cached(clat, clng)
                 if self._fail_until.get(key, 0) > time.time():
-                    return near
+                    return _stand_in(near, key, "the archive failed for this cell less than a minute ago")
                 fut = self._inflight.get(key)
                 if fut is None or fut.done():  # join a download still running for this cell
-                    fut = self._inflight[key] = _DOWNLOADS.submit(self._fetch_to_disk, clat, clng, key, path)
+                    # copy_context(): the download thread continues this request's trace
+                    fut = self._inflight[key] = _DOWNLOADS.submit(contextvars.copy_context().run,
+                                                                  self._fetch_to_disk, clat, clng, key, path)
                 # A hard cap on the wait (DNS and slow reads are not bounded by the connect
                 # timeout), shorter when a neighbouring record can stand in. A download that
                 # overruns keeps going in the background and fills the cache for next time.
+                wait_s = QUICK_DEADLINE_S if near else MAX_WAIT_S
                 try:
-                    data = fut.result(timeout=QUICK_DEADLINE_S if near else MAX_WAIT_S)
+                    data = fut.result(timeout=wait_s)
                 except Exception:  # noqa: BLE001 - wait timed out, or the download raised
-                    return near
+                    return _stand_in(near, key, f"the download did not finish within {wait_s:g} s")
                 if data is None:
-                    return near
+                    return _stand_in(near, key, "the download failed")
             self._mem[key] = data
             while len(self._mem) > 256:
                 self._mem.popitem(last=False)
-            return data
+            return _seen(source, key, data)
 
     def _nearest_cached(self, lat: float, lng: float) -> dict | None:
         """When the archive cannot be reached, the closest cell already on disk stands in if it
@@ -122,13 +133,18 @@ class RainfallService:
         return {**data, "nearby_km": round(best_km, 1)}
 
     def _fetch_to_disk(self, lat: float, lng: float, key: str, path: Path) -> dict | None:
+        t = time.perf_counter()
         data = self._download(lat, lng)
         if data is None:
             self._fail_until[key] = time.time() + 60
+            log.warning("rainfall download failed for cell %s; not retrying it for 60 s", key,
+                        extra={"pond.rainfall.cell": key})
             return None
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data))
         tmp.replace(path)
+        log.info("downloaded 10 years of rainfall for cell %s in %.1f s", key, time.perf_counter() - t,
+                 extra={"pond.rainfall.cell": key})
         return data
 
     def _download(self, lat: float, lng: float) -> dict | None:
@@ -148,6 +164,24 @@ class RainfallService:
             return {"time": times, "precip": precip, "grid_lat": raw.get("latitude"), "grid_lng": raw.get("longitude")}
         except (OSError, ValueError, http.client.HTTPException):
             return None
+
+
+def _seen(source: str, key: str, data: dict | None) -> dict | None:
+    """Count the lookup by source (memory, disk, download, nearby, fallback) and put the source on
+    the current span, so a trace shows whether the rainfall had to be fetched."""
+    RAIN_LOOKUPS.add(1, {"pond.rainfall.source": source})
+    trace.get_current_span().set_attributes({"pond.rainfall.source": source, "pond.rainfall.cell": key})
+    return data
+
+
+def _stand_in(near: dict | None, key: str, why: str) -> dict | None:
+    if near is not None:
+        log.warning("no rainfall for cell %s (%s); using the saved cell %.1f km away", key, why, near["nearby_km"],
+                    extra={"pond.rainfall.cell": key})
+        return _seen("nearby", key, near)
+    log.warning("no rainfall for cell %s (%s) and no saved cell within %.0f km; using the regional normal",
+                key, why, NEARBY_KM, extra={"pond.rainfall.cell": key})
+    return _seen("fallback", key, None)
 
 
 def cn_for_amc(cn: float) -> tuple[float, float]:

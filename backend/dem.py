@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import math
 import os
 import subprocess
@@ -26,10 +27,14 @@ from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
+from opentelemetry import trace
 
 import netfetch
 from geo import GeometryError
 from hydrology import Grid
+
+_tracer = trace.get_tracer("jaldrishti.dem")
+log = logging.getLogger("jaldrishti.dem")
 
 ARCSEC = 1.0 / 3600.0
 TILE_PX = 3600
@@ -103,15 +108,27 @@ class DemStore:
         return arr
 
     def _fetch_subprocess(self, lat_floor: int, lng_floor: int) -> None:
+        key = tile_key(lat_floor, lng_floor)
         cmd = [sys.executable, str(Path(__file__).resolve()), "fetch", str(lat_floor), str(lng_floor),
                "--root", str(self.root)]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.fetch_timeout_s)
-        except subprocess.TimeoutExpired as exc:
-            raise TileUnavailable("Timed out downloading satellite elevation for this region; try again.") from exc
-        if proc.returncode != 0:
-            raise TileUnavailable("Could not download satellite elevation for this region: "
-                                  + (proc.stderr.strip().splitlines() or ["unknown error"])[-1])
+        # The download runs in a helper process (so the decode memory is freed afterwards); its
+        # span here covers download + conversion, which only happens once per tile.
+        with _tracer.start_as_current_span("download DEM tile", attributes={"pond.dem.tile": key}) as span:
+            log.info("DEM tile %s is not cached; downloading it (about 40 MB)", key, extra={"pond.dem.tile": key})
+            t = time.perf_counter()
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.fetch_timeout_s)
+            except subprocess.TimeoutExpired as exc:
+                log.error("DEM tile %s download timed out after %d s", key, self.fetch_timeout_s, extra={"pond.dem.tile": key})
+                raise TileUnavailable("Timed out downloading satellite elevation for this region; try again.") from exc
+            if proc.returncode != 0:
+                reason = (proc.stderr.strip().splitlines() or ["unknown error"])[-1]
+                span.set_attribute("pond.dem.error", reason)
+                log.error("DEM tile %s download failed: %s", key, reason, extra={"pond.dem.tile": key})
+                raise TileUnavailable("Could not download satellite elevation for this region: " + reason)
+            npy, _ = self._paths(key)
+            span.set_attribute("pond.dem.ocean", not npy.exists())
+            log.info("DEM tile %s ready in %.1f s", key, time.perf_counter() - t, extra={"pond.dem.tile": key})
 
     # ---------------------------------------------------------------- windows
     def window(self, south: float, west: float, north: float, east: float, max_cells: int = 250_000) -> Grid:

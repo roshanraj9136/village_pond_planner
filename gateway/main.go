@@ -8,6 +8,7 @@
 //   - caches analysis results (gzip, LRU by bytes, TTL) and collapses identical
 //     concurrent requests into one upstream call (single-flight)
 //   - /gateway/status exposes live metrics for the status page
+//   - OpenTelemetry traces, metrics and logs over OTLP (see telemetry.go)
 package main
 
 import (
@@ -23,22 +24,33 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ---------------------------------------------------------------- workers
@@ -179,7 +191,11 @@ func (p *Pool) healthLoop(client *http.Client, every time.Duration) {
 			w.lastSeen.Store(time.Now().UnixMilli())
 		}
 		if was != ok {
-			log.Printf("worker %s is now %s", w.Name, map[bool]string{true: "UP", false: "DOWN"}[ok])
+			if ok {
+				slog.Info("worker is UP", "worker", w.Name, "url", w.URL())
+			} else {
+				slog.Warn("worker is DOWN", "worker", w.Name, "url", w.URL(), "error", fmt.Sprint(err))
+			}
 			p.mu.Lock()
 			close(p.wake)
 			p.wake = make(chan struct{})
@@ -206,6 +222,7 @@ type entry struct {
 	gz      []byte
 	expires time.Time
 	elem    *list.Element
+	origin  trace.SpanContext // the request whose trace computed this result
 }
 
 type Cache struct {
@@ -265,9 +282,10 @@ func (c *Cache) removeLocked(e *entry) {
 }
 
 type flight struct {
-	done chan struct{}
-	res  *entry
-	err  error
+	done   chan struct{}
+	res    *entry
+	err    error
+	leader trace.SpanContext // span of the request that does the work
 }
 
 type Group struct {
@@ -275,14 +293,16 @@ type Group struct {
 	m  map[string]*flight
 }
 
-func (g *Group) do(key string, fn func() (*entry, error)) (*entry, error, bool) {
+// do runs fn once per key at a time. Callers that arrive while it runs wait for its result
+// (shared=true) and get the span context of the request that ran it, to link their trace.
+func (g *Group) do(ctx context.Context, key string, fn func() (*entry, error)) (*entry, error, bool, trace.SpanContext) {
 	g.mu.Lock()
 	if f, ok := g.m[key]; ok {
 		g.mu.Unlock()
 		<-f.done
-		return f.res, f.err, true
+		return f.res, f.err, true, f.leader
 	}
-	f := &flight{done: make(chan struct{})}
+	f := &flight{done: make(chan struct{}), leader: trace.SpanContextFromContext(ctx)}
 	g.m[key] = f
 	g.mu.Unlock()
 	f.res, f.err = fn()
@@ -290,7 +310,7 @@ func (g *Group) do(key string, fn func() (*entry, error)) (*entry, error, bool) 
 	g.mu.Lock()
 	delete(g.m, key)
 	g.mu.Unlock()
-	return f.res, f.err, false
+	return f.res, f.err, false, f.leader
 }
 
 // ---------------------------------------------------------------- metrics
@@ -374,6 +394,61 @@ type Gateway struct {
 	registerKey  string  // shared with the workers; empty disables /gateway/register
 	statePath    string  // last announced worker addresses, so a restart does not forget them
 	stateMu      sync.Mutex
+	otel         *otelMetrics
+	browserOTLP  http.Handler // forwards browser spans to the collector (nil: disabled)
+	routes       []extraRoute // other services on this host that share the public port
+}
+
+// extraRoute sends one path prefix to another local service (for example the location API
+// of a different assignment), so it can use the same public port without touching the site.
+type extraRoute struct {
+	prefix string
+	proxy  *httputil.ReverseProxy
+}
+
+func (g *Gateway) extraRoute(p string) *httputil.ReverseProxy {
+	for _, rt := range g.routes {
+		if p == rt.prefix || strings.HasPrefix(p, rt.prefix+"/") {
+			return rt.proxy
+		}
+	}
+	return nil
+}
+
+// parseRoutes reads "/prefix=http://host:port,...". A bad entry is logged and skipped, never
+// fatal, so a typo in the setting cannot keep the site itself from starting.
+func parseRoutes(spec string) []extraRoute {
+	transport := &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 3 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 15 * time.Second,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       90 * time.Second,
+	}
+	var routes []extraRoute
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		prefix, target, ok := strings.Cut(part, "=")
+		prefix = strings.TrimSuffix(prefix, "/")
+		u, err := url.Parse(target)
+		if !ok || !strings.HasPrefix(prefix, "/") || prefix == "/" || err != nil || u.Host == "" ||
+			isAPI(prefix) || strings.HasPrefix(prefix, "/gateway") || strings.HasPrefix(prefix, "/assets") {
+			slog.Warn("ignoring route (want /prefix=http://host:port, not a path the site uses)", "entry", part)
+			continue
+		}
+		name := prefix
+		rp := httputil.NewSingleHostReverseProxy(u)
+		rp.Transport = transport
+		rp.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			slog.Warn("extra route error", "route", name, "error", err)
+			errJSON(w, http.StatusBadGateway, "the service behind "+name+" is not answering")
+		}
+		routes = append(routes, extraRoute{prefix: prefix, proxy: rp})
+		slog.Info("extra route registered", "prefix", prefix, "target", u.String())
+	}
+	return routes
 }
 
 // register records a worker's current address. Workers listen only on ports the lab host
@@ -416,7 +491,7 @@ func (g *Gateway) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if base := u.Scheme + "://" + u.Host; wk.URL() != base {
-		log.Printf("worker %s announced address %s (was %q)", wk.Name, base, wk.URL())
+		slog.Info("worker announced its address", "worker", wk.Name, "url", base, "previous", wk.URL())
 		wk.SetURL(base)
 		g.saveState()
 	}
@@ -436,11 +511,11 @@ func (g *Gateway) saveState() {
 	data, _ := json.Marshal(addrs)
 	tmp := g.statePath + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		log.Printf("saving worker addresses: %v", err)
+		slog.Error("saving worker addresses", "error", err)
 		return
 	}
 	if err := os.Rename(tmp, g.statePath); err != nil {
-		log.Printf("saving worker addresses: %v", err)
+		slog.Error("saving worker addresses", "error", err)
 	}
 }
 
@@ -500,6 +575,17 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := rec.Header()
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+	// the low-cardinality route goes on the server span and on otelhttp's request metrics
+	route := routeOf(r.URL.Path)
+	trace.SpanFromContext(r.Context()).SetAttributes(semconv.HTTPRoute(route))
+	if lab, ok := otelhttp.LabelerFromContext(r.Context()); ok {
+		lab.Add(semconv.HTTPRoute(route))
+	}
+	if rp := g.extraRoute(r.URL.Path); rp != nil {
+		rp.ServeHTTP(rec, r)
+		g.metrics.record(rec.status, time.Since(t0), false)
+		return
+	}
 	switch {
 	case r.URL.Path == "/gateway/status":
 		g.status(rec)
@@ -507,15 +593,37 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(rec, 200, map[string]any{"status": "ok"})
 	case r.URL.Path == "/gateway/register":
 		g.register(rec, r)
+	case r.URL.Path == "/otel/v1/traces" && g.browserOTLP != nil:
+		g.browserOTLP.ServeHTTP(rec, r)
 	case isAPI(r.URL.Path):
 		g.metrics.api.Add(1)
 		g.proxy(rec, r)
-		g.metrics.record(rec.status, time.Since(t0), r.Method == http.MethodPost || strings.HasPrefix(r.URL.Path, "/api/sample"))
+		d := time.Since(t0)
+		g.metrics.record(rec.status, d, r.Method == http.MethodPost || strings.HasPrefix(r.URL.Path, "/api/sample"))
+		g.logRequest(r, rec, route, d)
 		return
 	default:
 		g.serveStatic(rec, r)
 	}
 	g.metrics.record(rec.status, time.Since(t0), false)
+}
+
+// logRequest writes one line per API request. With the request's context the OpenTelemetry
+// bridge attaches its trace id, so the line leads straight to the trace.
+func (g *Gateway) logRequest(r *http.Request, rec *statusRecorder, route string, d time.Duration) {
+	if route == "/api/health" {
+		return
+	}
+	level := slog.LevelInfo
+	switch {
+	case rec.status == http.StatusServiceUnavailable:
+		level = slog.LevelWarn
+	case rec.status >= 500:
+		level = slog.LevelError
+	}
+	slog.Log(r.Context(), level, "api request", "method", r.Method, "route", route, "status", rec.status,
+		"cache", rec.Header().Get("X-Cache"), "worker", rec.Header().Get("X-Worker"),
+		"duration_ms", round1(float64(d.Microseconds())/1000))
 }
 
 type statusRecorder struct {
@@ -580,22 +688,33 @@ func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(sum, "%s %s?%s\n%s\n", r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Content-Type"))
 	sum.Write(body)
 	key := hex.EncodeToString(sum.Sum(nil))
+	span := trace.SpanFromContext(r.Context())
 	if e := g.cache.get(key); e != nil {
 		g.cache.hits.Add(1)
+		// no worker span in this trace: the link points to the trace that did the work
+		if e.origin.IsValid() {
+			span.AddLink(trace.Link{SpanContext: e.origin,
+				Attributes: []attribute.KeyValue{attribute.String("pond.link", "computed the cached result")}})
+		}
 		g.respond(w, r, e, nil, "HIT")
 		return
 	}
-	e, err, shared := g.group.do(key, func() (*entry, error) {
+	e, err, shared, leader := g.group.do(r.Context(), key, func() (*entry, error) {
 		// detached: other callers may be waiting on this result even if this client leaves
 		e, err := g.forward(context.WithoutCancel(r.Context()), r, body)
 		if err == nil && e.status == http.StatusOK {
 			e.key = key
+			e.origin = trace.SpanContextFromContext(r.Context())
 			g.cache.put(e)
 		}
 		return e, err
 	})
 	if shared {
 		g.cache.shared.Add(1)
+		if leader.IsValid() {
+			span.AddLink(trace.Link{SpanContext: leader,
+				Attributes: []attribute.KeyValue{attribute.String("pond.link", "identical request in flight that computed this result")}})
+		}
 		g.respond(w, r, e, err, "SHARED")
 		return
 	}
@@ -620,10 +739,9 @@ func (g *Gateway) forward(parent context.Context, r *http.Request, body []byte) 
 		attempts = 1
 	}
 	var lastErr error
+	lastReason := ""
 	for attempt := 0; attempt < attempts; attempt++ {
-		qctx, qcancel := context.WithTimeout(ctx, g.queueTimeout)
-		wk, err := g.pool.acquire(qctx, avoid)
-		qcancel()
+		wk, err := g.waitForSlot(ctx, avoid)
 		if err != nil {
 			if lastErr != nil {
 				return nil, lastErr
@@ -632,54 +750,16 @@ func (g *Gateway) forward(parent context.Context, r *http.Request, body []byte) 
 		}
 		if attempt > 0 {
 			g.metrics.retries.Add(1)
+			g.otel.retries.Add(ctx, 1, metric.WithAttributes(attribute.String("pond.reason", lastReason)))
 		}
-		t := time.Now()
-		req, _ := http.NewRequestWithContext(ctx, r.Method, wk.URL()+r.URL.RequestURI(), bytes.NewReader(body))
-		for k, vs := range r.Header {
-			if !hopHeaders[k] && k != "Accept-Encoding" {
-				req.Header[k] = vs
-			}
+		e, reason, err := g.attempt(ctx, r, body, wk, attempt+1)
+		if err == nil {
+			return e, nil
 		}
-		req.Header.Set("X-Forwarded-For", clientIP(r))
-		resp, err := g.client.Do(req)
-		if err != nil {
-			g.pool.release(wk)
-			wk.failures.Add(1)
-			if ctx.Err() == nil {
-				wk.alive.Store(false) // health loop brings it back
-			}
-			lastErr = fmt.Errorf("worker %s: %w", wk.Name, err)
-			avoid[wk] = true
-			continue
-		}
-		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-		resp.Body.Close()
-		g.pool.release(wk)
-		if rerr != nil {
-			wk.failures.Add(1)
-			lastErr = rerr
-			avoid[wk] = true
-			continue
-		}
-		if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("X-Worker-Busy") != "" {
-			wk.busy503.Add(1)
-			avoid[wk] = true
-			lastErr = errOverloaded
-			continue
-		}
-		wk.served.Add(1)
-		wk.observe(time.Since(t))
-		hdr := http.Header{}
-		for k, vs := range resp.Header {
-			if !hopHeaders[k] {
-				hdr[k] = vs
-			}
-		}
-		var buf bytes.Buffer
-		zw, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
-		_, _ = zw.Write(raw)
-		_ = zw.Close()
-		return &entry{status: resp.StatusCode, header: hdr, gz: buf.Bytes()}, nil
+		lastErr, lastReason = err, reason
+		avoid[wk] = true
+		slog.WarnContext(ctx, "forwarding attempt failed", "worker", wk.Name, "attempt", attempt+1,
+			"reason", reason, "error", err.Error())
 	}
 	if lastErr == nil {
 		lastErr = errOverloaded
@@ -687,10 +767,130 @@ func (g *Gateway) forward(parent context.Context, r *http.Request, body []byte) 
 	return nil, lastErr
 }
 
+// childSpan starts a span only inside a traced request, so untraced paths (health checks)
+// do not start traces of their own.
+func childSpan(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return ctx, trace.SpanFromContext(ctx)
+	}
+	return tracer.Start(ctx, name, opts...)
+}
+
+// waitForSlot is the admission queue as a span: how long the request waited for a worker
+// with a free slot, and which worker it got.
+func (g *Gateway) waitForSlot(ctx context.Context, avoid map[*Worker]bool) (*Worker, error) {
+	sctx, span := childSpan(ctx, "wait for worker slot",
+		trace.WithAttributes(attribute.Int64("pond.queue.waiting", g.pool.waiting.Load())))
+	defer span.End()
+	qctx, qcancel := context.WithTimeout(sctx, g.queueTimeout)
+	defer qcancel()
+	t := time.Now()
+	wk, err := g.pool.acquire(qctx, avoid)
+	outcome := "acquired"
+	switch {
+	case errors.Is(err, errOverloaded):
+		outcome = "queue_full"
+	case err != nil:
+		outcome = "timeout"
+	}
+	g.otel.queueWait.Record(ctx, time.Since(t).Seconds(), metric.WithAttributes(attribute.String("pond.outcome", outcome)))
+	span.SetAttributes(attribute.String("pond.outcome", outcome))
+	if err != nil {
+		span.SetStatus(codes.Error, outcome)
+		return nil, err
+	}
+	span.SetAttributes(attribute.String("pond.worker", wk.Name))
+	return wk, nil
+}
+
+// attempt sends the request to one worker (a CLIENT span; the worker continues the trace
+// through the traceparent header). On failure it says why: connect_error, read_error or
+// worker_busy. The worker's slot is released in every case.
+func (g *Gateway) attempt(ctx context.Context, r *http.Request, body []byte, wk *Worker, n int) (*entry, string, error) {
+	target := wk.URL() + r.URL.RequestURI()
+	ctx, span := childSpan(ctx, "forward "+r.Method+" "+routeOf(r.URL.Path), trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("http.request.method", r.Method), semconv.URLFull(target),
+			attribute.String("pond.worker", wk.Name), attribute.Int("pond.attempt", n)))
+	defer span.End()
+	if u, err := url.Parse(wk.URL()); err == nil {
+		span.SetAttributes(semconv.ServerAddress(u.Hostname()))
+		if p, err := strconv.Atoi(u.Port()); err == nil {
+			span.SetAttributes(semconv.ServerPort(p))
+		}
+	}
+	t := time.Now()
+	outcome := "ok"
+	defer func() {
+		g.otel.upstream.Record(ctx, time.Since(t).Seconds(),
+			metric.WithAttributes(attribute.String("pond.worker", wk.Name), attribute.String("pond.outcome", outcome)))
+	}()
+	fail := func(reason, msg string, err error) (*entry, string, error) {
+		outcome = reason
+		span.RecordError(err)
+		span.SetStatus(codes.Error, msg)
+		span.SetAttributes(attribute.String("error.type", reason))
+		return nil, reason, err
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, r.Method, target, bytes.NewReader(body))
+	for k, vs := range r.Header {
+		if !hopHeaders[k] && k != "Accept-Encoding" {
+			req.Header[k] = vs
+		}
+	}
+	req.Header.Set("X-Forwarded-For", clientIP(r))
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+	resp, err := g.client.Do(req)
+	if err != nil {
+		g.pool.release(wk)
+		wk.failures.Add(1)
+		if ctx.Err() == nil {
+			wk.alive.Store(false) // health loop brings it back
+		}
+		return fail("connect_error", "worker did not answer", fmt.Errorf("worker %s: %w", wk.Name, err))
+	}
+	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	resp.Body.Close()
+	g.pool.release(wk)
+	span.SetAttributes(semconv.HTTPResponseStatusCode(resp.StatusCode))
+	if rerr != nil {
+		wk.failures.Add(1)
+		return fail("read_error", "reading the worker's response failed", rerr)
+	}
+	if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("X-Worker-Busy") != "" {
+		wk.busy503.Add(1)
+		return fail("worker_busy", "worker busy", errOverloaded)
+	}
+	if resp.StatusCode >= 500 {
+		span.SetStatus(codes.Error, http.StatusText(resp.StatusCode))
+	}
+	wk.served.Add(1)
+	wk.observe(time.Since(t))
+	hdr := http.Header{}
+	for k, vs := range resp.Header {
+		if !hopHeaders[k] {
+			hdr[k] = vs
+		}
+	}
+	var buf bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	_, _ = zw.Write(raw)
+	_ = zw.Close()
+	return &entry{status: resp.StatusCode, header: hdr, gz: buf.Bytes()}, "", nil
+}
+
 func (g *Gateway) respond(w http.ResponseWriter, r *http.Request, e *entry, err error, cacheState string) {
+	ctx := r.Context()
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("pond.cache", cacheState))
+	if lab, ok := otelhttp.LabelerFromContext(ctx); ok {
+		lab.Add(attribute.String("pond.cache", cacheState))
+	}
+	g.otel.cacheLookups.Add(ctx, 1, metric.WithAttributes(attribute.String("pond.cache.result", strings.ToLower(cacheState))))
 	if err != nil {
 		if errors.Is(err, errOverloaded) || errors.Is(err, context.DeadlineExceeded) {
 			g.metrics.shed.Add(1)
+			g.otel.shed.Add(ctx, 1)
+			trace.SpanFromContext(ctx).SetAttributes(attribute.Bool("pond.shed", true))
 			w.Header().Set("Retry-After", "3")
 			errJSON(w, http.StatusServiceUnavailable, "All analysis workers are busy. Please retry in a few seconds.")
 			return
@@ -698,7 +898,7 @@ func (g *Gateway) respond(w http.ResponseWriter, r *http.Request, e *entry, err 
 		if errors.Is(err, context.Canceled) {
 			return
 		}
-		log.Printf("upstream error %s %s: %v", r.Method, r.URL.Path, err)
+		slog.ErrorContext(ctx, "upstream error", "method", r.Method, "path", r.URL.Path, "error", err.Error())
 		errJSON(w, http.StatusBadGateway, "No analysis worker could complete the request.")
 		return
 	}
@@ -886,14 +1086,22 @@ func main() {
 	maxBodyMB := flag.Int64("max-body-mb", 26, "largest request body (contour uploads)")
 	version := flag.String("version", "dev", "build identifier shown in /gateway/status")
 	sitesFlag := flag.String("sites-worker", "", "worker that runs next to PostgreSQL and serves /api/sites (empty: any worker)")
+	routesFlag := flag.String("routes", os.Getenv("GATEWAY_ROUTES"), "extra /prefix=url routes to other local services (default: $GATEWAY_ROUTES)")
 	flag.Parse()
+
+	instance, _ := os.Hostname()
+	shutdownTelemetry, err := setupTelemetry(context.Background(), *version, instance)
+	if err != nil {
+		slog.Error("OpenTelemetry setup failed; running without it", "error", err)
+		shutdownTelemetry = func(context.Context) error { return nil }
+	}
 
 	var workers []*Worker
 	var sitesWorker *Worker
 	for _, part := range strings.Split(*workersFlag, ",") {
 		name, base, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if !ok {
-			log.Fatalf("bad -workers entry %q (want name=url)", part)
+			fatal("bad -workers entry (want name=url)", "entry", part)
 		}
 		wk := NewWorker(name, base)
 		workers = append(workers, wk)
@@ -902,7 +1110,7 @@ func main() {
 		}
 	}
 	if *sitesFlag != "" && sitesWorker == nil {
-		log.Fatalf("-sites-worker %q is not in -workers", *sitesFlag)
+		fatal("-sites-worker is not in -workers", "sites_worker", *sitesFlag)
 	}
 	if *statePath != "" {
 		loadState(*statePath, workers)
@@ -929,9 +1137,20 @@ func main() {
 		sitesWorker:  sitesWorker,
 		registerKey:  strings.TrimSpace(os.Getenv("REGISTER_KEY")), // from the environment, so it never shows in ps
 		statePath:    *statePath,
+		browserOTLP:  browserTraces(),
+		routes:       parseRoutes(*routesFlag),
 	}
+	if g.otel, err = newOtelMetrics(g); err != nil {
+		slog.Warn("some OpenTelemetry instruments could not be created", "error", err)
+	}
+	// otelhttp: a server span per traced request (span name "METHOD /route"), continuing the
+	// caller's trace if the request carries a traceparent header, plus http.server metrics.
+	handler := otelhttp.NewHandler(g, "gateway",
+		otelhttp.WithFilter(traced),
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return r.Method + " " + routeOf(r.URL.Path) }),
+	)
 	srv := &http.Server{
-		Handler:           g,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      *upstreamTimeout + *queueTimeout + 30*time.Second,
@@ -940,28 +1159,41 @@ func main() {
 		IdleTimeout:    10 * time.Minute,
 		MaxHeaderBytes: 1 << 16,
 	}
+	stopped := make(chan struct{})
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
+		s := <-sig
+		slog.Info("shutting down", "signal", s.String())
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		if err := shutdownTelemetry(ctx); err != nil {
+			slog.Warn("flushing telemetry on shutdown failed", "error", err)
+		}
+		close(stopped)
 	}()
 	var listeners []net.Listener
 	for _, a := range strings.Split(*addr, ",") {
 		l, err := net.Listen("tcp", strings.TrimSpace(a))
 		if err != nil {
-			log.Fatalf("listen %s: %v", a, err)
+			fatal("cannot listen", "addr", a, "error", err)
 		}
 		listeners = append(listeners, l)
 	}
-	log.Printf("gateway %s listening on %s, %d workers, static=%s", *version, *addr, len(workers), *static)
+	slog.Info("gateway listening", "version", *version, "addr", *addr, "workers", len(workers), "static", *static,
+		"telemetry", os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "")
 	errs := make(chan error, len(listeners))
 	for _, l := range listeners {
 		go func(l net.Listener) { errs <- srv.Serve(l) }(l)
 	}
 	if err := <-errs; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+		fatal("server stopped", "error", err)
 	}
+	<-stopped // let in-flight requests finish and the last spans, metrics and logs leave
+}
+
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }

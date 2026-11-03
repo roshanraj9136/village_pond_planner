@@ -1,3 +1,4 @@
+import './lib/telemetry' // first, so fetch is instrumented before the app makes any request
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import '@fontsource/mukta/latin-400.css'

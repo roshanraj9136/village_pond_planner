@@ -29,6 +29,7 @@ import hydrology as hy
 from geo import (GeometryError, M_PER_DEG, bbox_geojson, circle_ring, rasterize_ring, ring_area_m2,
                  ring_bbox, ring_is_simple, ring_perimeter_m)
 from rainfall import RainfallService, water_budget
+from telemetry import stage, tracer
 
 MIN_PARCEL_M2 = 400.0          # 20 m x 20 m
 MAX_PARCEL_M2 = 25_000_000.0   # 25 km^2
@@ -98,17 +99,15 @@ def validate_parcel(ring) -> dict:
 
 def flow_model(grid: hy.Grid) -> FlowModel:
     ms = {}
-    t = time.perf_counter()
-    valid = np.isfinite(grid.z)
-    if valid.sum() < 9:
-        raise GeometryError("No elevation data is available for this area.")
-    filled = hy.priority_flood_fill(grid.z, valid)
-    ms["fill"] = (time.perf_counter() - t) * 1e3
+    with stage("fill depressions", "fill", ms, **{"pond.grid.cells": int(grid.z.size)}):
+        valid = np.isfinite(grid.z)
+        if valid.sum() < 9:
+            raise GeometryError("No elevation data is available for this area.")
+        filled = hy.priority_flood_fill(grid.z, valid)
 
-    t = time.perf_counter()
-    recv = hy.d8_receivers(filled, valid, grid.dx_m, grid.dy_m)
-    acc, order = hy.flow_accumulation(filled, recv, valid, grid.cell_area)
-    ms["flow"] = (time.perf_counter() - t) * 1e3
+    with stage("flow accumulation", "flow", ms):
+        recv = hy.d8_receivers(filled, valid, grid.dx_m, grid.dy_m)
+        acc, order = hy.flow_accumulation(filled, recv, valid, grid.cell_area)
     return FlowModel(grid, valid, filled, recv, acc, order, hy.boundary_cells(valid), ms)
 
 
@@ -119,39 +118,39 @@ def run_hydrology(grid: hy.Grid, ring) -> Hydro:
 def select_site(fm: FlowModel, ring) -> Hydro:
     grid, valid, filled, recv, acc, order, edge = fm.grid, fm.valid, fm.filled, fm.recv, fm.acc, fm.order, fm.edge
     ms = dict(fm.ms)
-    t = time.perf_counter()
-    if ring is not None:
-        parcel = rasterize_ring(ring, grid.lats, grid.lngs) & valid
-        if not parcel.any():  # parcel smaller than one cell: use the cell under its centroid
-            clng = sum(p[0] for p in ring) / len(ring)
-            clat = sum(p[1] for p in ring) / len(ring)
-            r = int(np.argmin(np.abs(grid.lats - clat)))
-            c = int(np.argmin(np.abs(grid.lngs - clng)))
-            if not valid[r, c]:
-                raise GeometryError("No elevation data inside the selected area.")
-            parcel = np.zeros_like(valid)
-            parcel[r, c] = True
-    else:
-        parcel = valid.copy()
+    with stage("find site and catchment", "catchment", ms) as span:
+        if ring is not None:
+            parcel = rasterize_ring(ring, grid.lats, grid.lngs) & valid
+            if not parcel.any():  # parcel smaller than one cell: use the cell under its centroid
+                clng = sum(p[0] for p in ring) / len(ring)
+                clat = sum(p[1] for p in ring) / len(ring)
+                r = int(np.argmin(np.abs(grid.lats - clat)))
+                c = int(np.argmin(np.abs(grid.lngs - clng)))
+                if not valid[r, c]:
+                    raise GeometryError("No elevation data inside the selected area.")
+                parcel = np.zeros_like(valid)
+                parcel[r, c] = True
+        else:
+            parcel = valid.copy()
 
-    # Cells on the data edge drain "off the map" artificially; avoid them when possible.
-    candidates = parcel & ~edge
-    if ring is None:
-        inner = valid.copy()
-        for _ in range(3):
-            inner &= ~hy.boundary_cells(inner)
-        if (candidates & inner).any():
-            candidates &= inner
-    if not candidates.any():
-        candidates = parcel
-    flat_c = np.flatnonzero(candidates.ravel())
-    acc_c = acc[flat_c]
-    best = acc_c.max()
-    ties = flat_c[acc_c >= best * (1 - 1e-9)]
-    outlet = int(ties[np.argmin(filled.ravel()[ties])])
-    catchment = hy.upstream_mask(recv, order, outlet, grid.shape)
-    touches = bool((catchment & edge).any())
-    ms["catchment"] = (time.perf_counter() - t) * 1e3
+        # Cells on the data edge drain "off the map" artificially; avoid them when possible.
+        candidates = parcel & ~edge
+        if ring is None:
+            inner = valid.copy()
+            for _ in range(3):
+                inner &= ~hy.boundary_cells(inner)
+            if (candidates & inner).any():
+                candidates &= inner
+        if not candidates.any():
+            candidates = parcel
+        flat_c = np.flatnonzero(candidates.ravel())
+        acc_c = acc[flat_c]
+        best = acc_c.max()
+        ties = flat_c[acc_c >= best * (1 - 1e-9)]
+        outlet = int(ties[np.argmin(filled.ravel()[ties])])
+        catchment = hy.upstream_mask(recv, order, outlet, grid.shape)
+        touches = bool((catchment & edge).any())
+        span.set_attributes({"pond.catchment.cells": int(catchment.sum()), "pond.catchment.touches_edge": touches})
     return Hydro(grid, valid, filled, recv, acc, order, parcel, outlet, catchment, touches, ms)
 
 
@@ -164,7 +163,7 @@ def dem_hydrology(store, ring, parcel_info) -> tuple[Hydro, dict]:
     buffer_m = min(max(1.5 * extent, 1200.0), 3000.0)
     tries = []
     hydro = None
-    t_dem = 0.0
+    dem_ms: dict = {}
     while True:
         # keep the window inside the cell budget (1" cells ~ 30.9 m x 28.8 m here)
         w_cells = ((max_lng - min_lng) * kx + 2 * buffer_m) / (M_PER_DEG / 3600 * math.cos(math.radians(mid_lat)))
@@ -175,16 +174,21 @@ def dem_hydrology(store, ring, parcel_info) -> tuple[Hydro, dict]:
             buffer_m = max(0.0, (buffer_m * 2 + extent) * scale - extent) / 2
         dlat = buffer_m / M_PER_DEG
         dlng = buffer_m / kx
-        t = time.perf_counter()
-        grid = store.window(min_lat - dlat, min_lng - dlng, max_lat + dlat, max_lng + dlng,
-                            max_cells=int(MAX_WINDOW_CELLS * 1.3))
-        t_dem += (time.perf_counter() - t) * 1e3
-        hydro = run_hydrology(grid, ring)
+        # One span per attempt: when the catchment reaches the window edge the window is
+        # widened and the whole hydrology runs again, which shows up as a second attempt.
+        with tracer.start_as_current_span("DEM window attempt", attributes={
+                "pond.window.attempt": len(tries) + 1, "pond.window.buffer_m": round(buffer_m)}) as span:
+            with stage("read DEM window", "dem_read", dem_ms, accumulate=True):
+                grid = store.window(min_lat - dlat, min_lng - dlng, max_lat + dlat, max_lng + dlng,
+                                    max_cells=int(MAX_WINDOW_CELLS * 1.3))
+            hydro = run_hydrology(grid, ring)
+            span.set_attributes({"pond.window.cells": int(grid.z.size),
+                                 "pond.catchment.touches_edge": hydro.touches_edge})
         tries.append({"buffer_m": round(buffer_m), "cells": int(grid.z.size), "catchment_touches_edge": hydro.touches_edge})
         if not hydro.touches_edge or at_limit or len(tries) >= 4:
             break
         buffer_m *= 2.2
-    hydro.ms["dem_read"] = t_dem
+    hydro.ms["dem_read"] = dem_ms["dem_read"]
     return hydro, {"window_attempts": tries}
 
 
@@ -284,50 +288,52 @@ def build_result(hydro: Hydro, ring, parcel_info: dict | None, params: Params, r
     zc = grid.z[hydro.catchment]
     relief = float(np.nanmax(zc) - np.nanmin(zc)) if zc.size else 0.0
 
-    t = time.perf_counter()
-    series = rain.series(site_lat, site_lng)
-    budget = water_budget(series, params.curve_number)
-    ms_rain = (time.perf_counter() - t) * 1e3
+    stage_ms: dict = {}
+    with stage("rainfall and runoff", "rainfall", stage_ms):
+        series = rain.series(site_lat, site_lng)
+        budget = water_budget(series, params.curve_number)
+    ms_rain = stage_ms["rainfall"]
 
-    runoff_m3 = budget["runoff_depth_mm"] / 1000.0 * catch_m2
-    land_limit = min(MAX_POND_FRACTION * parcel_m2, float(cell_area[hydro.parcel].sum()) or parcel_m2)
-    max_area = min(land_limit, params.max_pond_area_m2)
-    top_area = size_pond(runoff_m3, max_area, params)
-    limited_by = ("land" if land_limit <= params.max_pond_area_m2 else "max_pond_area") \
-        if top_area >= max_area * 0.999 else "runoff"
+    with stage("size pond", "pond"):
+        runoff_m3 = budget["runoff_depth_mm"] / 1000.0 * catch_m2
+        land_limit = min(MAX_POND_FRACTION * parcel_m2, float(cell_area[hydro.parcel].sum()) or parcel_m2)
+        max_area = min(land_limit, params.max_pond_area_m2)
+        top_area = size_pond(runoff_m3, max_area, params)
+        limited_by = ("land" if land_limit <= params.max_pond_area_m2 else "max_pond_area") \
+            if top_area >= max_area * 0.999 else "runoff"
 
-    # footprint over the lowest parcel ground around the site
-    fp_mask, fp_area = _grow_footprint(hydro, top_area)
-    cell_m2 = float(grid.cell_area[r, 0])
-    if fp_mask.sum() >= 9:
-        top_area = min(top_area, fp_area)
-        footprint = hy.mask_to_geojson(grid, fp_mask, smooth=2)
-        fr, fc = np.nonzero(fp_mask)
-        centre = [round(float(grid.lngs[fc].mean()), 6), round(float(grid.lats[fr].mean()), 6)]
-    else:
-        footprint = {"type": "Polygon", "coordinates": [circle_ring(site_lat, site_lng, math.sqrt(top_area / math.pi))]}
-        centre = [round(site_lng, 6), round(site_lat, 6)]
-    capacity, usable_depth = pond_volume(top_area, params.pond_depth_m, params.side_slope)
-    collected = min(runoff_m3, capacity)
-    side = math.sqrt(top_area)
+        # footprint over the lowest parcel ground around the site
+        fp_mask, fp_area = _grow_footprint(hydro, top_area)
+        cell_m2 = float(grid.cell_area[r, 0])
+        if fp_mask.sum() >= 9:
+            top_area = min(top_area, fp_area)
+            footprint = hy.mask_to_geojson(grid, fp_mask, smooth=2)
+            fr, fc = np.nonzero(fp_mask)
+            centre = [round(float(grid.lngs[fc].mean()), 6), round(float(grid.lats[fr].mean()), 6)]
+        else:
+            footprint = {"type": "Polygon", "coordinates": [circle_ring(site_lat, site_lng, math.sqrt(top_area / math.pi))]}
+            centre = [round(site_lng, 6), round(site_lat, 6)]
+        capacity, usable_depth = pond_volume(top_area, params.pond_depth_m, params.side_slope)
+        collected = min(runoff_m3, capacity)
+        side = math.sqrt(top_area)
 
     # map layers -------------------------------------------------------------
-    t = time.perf_counter()
-    catch_geo = hy.mask_to_geojson(grid, hydro.catchment, smooth=2)
-    stream_thr = max(20 * cell_m2, min(catch_m2 / 25.0, 250_000.0))
-    streams = hy.stream_features(grid, hydro.recv, hydro.acc, hydro.valid, stream_thr, hydro.catchment)
-    layers = {"streams": {"type": "FeatureCollection", "features": streams}}
-    if extra_layers and "contours" in extra_layers:
-        layers["contours"] = extra_layers["contours"]
-        contour_interval = extra_layers.get("contour_interval_m")
-    else:
-        zs = hy.smooth_nan(grid.z, 2.0)  # display only: 30 m DSM carries tree and bund noise
-        finite = zs[np.isfinite(zs)]
-        contour_interval = hy.nice_interval(float(finite.max() - finite.min())) if finite.size else 1.0
-        layers["contours"] = {"type": "FeatureCollection", "features": hy.contour_features(grid, zs, contour_interval)}
-    layers["window"] = bbox_geojson(float(grid.lngs[0] - grid.dlng / 2), float(grid.lats[-1] - grid.dlat / 2),
-                                    float(grid.lngs[-1] + grid.dlng / 2), float(grid.lats[0] + grid.dlat / 2))
-    ms_layers = (time.perf_counter() - t) * 1e3
+    with stage("map layers", "layers", stage_ms):
+        catch_geo = hy.mask_to_geojson(grid, hydro.catchment, smooth=2)
+        stream_thr = max(20 * cell_m2, min(catch_m2 / 25.0, 250_000.0))
+        streams = hy.stream_features(grid, hydro.recv, hydro.acc, hydro.valid, stream_thr, hydro.catchment)
+        layers = {"streams": {"type": "FeatureCollection", "features": streams}}
+        if extra_layers and "contours" in extra_layers:
+            layers["contours"] = extra_layers["contours"]
+            contour_interval = extra_layers.get("contour_interval_m")
+        else:
+            zs = hy.smooth_nan(grid.z, 2.0)  # display only: 30 m DSM carries tree and bund noise
+            finite = zs[np.isfinite(zs)]
+            contour_interval = hy.nice_interval(float(finite.max() - finite.min())) if finite.size else 1.0
+            layers["contours"] = {"type": "FeatureCollection", "features": hy.contour_features(grid, zs, contour_interval)}
+        layers["window"] = bbox_geojson(float(grid.lngs[0] - grid.dlng / 2), float(grid.lats[-1] - grid.dlat / 2),
+                                        float(grid.lngs[-1] + grid.dlng / 2), float(grid.lats[0] + grid.dlat / 2))
+    ms_layers = stage_ms["layers"]
 
     notes = list(notes or [])
     if hydro.touches_edge:

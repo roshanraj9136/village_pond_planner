@@ -1,4 +1,5 @@
 // All calls are relative, so the app works behind the gateway on any host/port.
+import { tracedFetch } from './telemetry'
 
 export class ApiError extends Error {
   constructor(message, status) {
@@ -109,7 +110,7 @@ async function request(url, options = {}, { retries = 0, onRetry, idempotent = t
     await ensureConnection(options.signal)
     let res
     try {
-      res = await fetch(url, options)
+      res = await tracedFetch(url, options)
     } catch (err) {
       if (err.name === 'AbortError') throw err
       if (idempotent && networkFailures++ < 2) continue

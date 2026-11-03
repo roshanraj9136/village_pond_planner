@@ -19,6 +19,7 @@ import {
   searchPlace,
 } from './lib/api'
 import { acres, boundsOf, fmt, fmtArea, ringArea, toPolygon } from './lib/format'
+import { userAction } from './lib/telemetry'
 
 const REPO = 'https://github.com/roshanraj9136/village_pond_planner'
 
@@ -105,14 +106,15 @@ function Planner() {
     setRetrying(0)
     const slowTimer = setTimeout(() => setSlow(true), 5000)
     try {
-      const { body, meta: m } =
+      const { body, meta: m } = await userAction('find pond site', { 'pond.source': source }, () =>
         source === 'satellite'
-          ? await analyzeParcel(toPolygon(area), params, ctl.signal, setRetrying)
-          : await analyzeContour(
+          ? analyzeParcel(toPolygon(area), params, ctl.signal, setRetrying)
+          : analyzeContour(
               { file: contourInput?.file, useSample: !!contourInput?.sample, area: area ? toPolygon(area) : null, params },
               ctl.signal,
               setRetrying,
-            )
+            ),
+      )
       setResult(body)
       setMeta(m)
       setVersion((v) => v + 1)
@@ -187,7 +189,7 @@ function Planner() {
   const onSave = async (name) => {
     setSaving(true)
     try {
-      await saveSite({
+      await userAction('save site', { 'pond.source': result.source.type }, () => saveSite({
         name,
         lat: result.pond.lat,
         lng: result.pond.lng,
@@ -200,7 +202,7 @@ function Planner() {
         pond_area_m2: result.pond.surface_area_m2,
         depth_m: result.pond.depth_m,
         area_geojson: result.selected_area?.geojson || null,
-      })
+      }))
       setToast(`Saved "${name}"`)
       refreshSites()
     } catch (e) {
@@ -212,7 +214,7 @@ function Planner() {
 
   const onDelete = async (site) => {
     try {
-      await deleteSite(site.id)
+      await userAction('delete site', {}, () => deleteSite(site.id))
       setToast(`Removed "${site.name}"`)
       refreshSites()
     } catch (e) {

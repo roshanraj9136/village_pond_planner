@@ -6,8 +6,11 @@ analysis endpoints keep working and only saving/listing reports 503.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
+
+log = logging.getLogger("jaldrishti.sites")
 
 SCHEMA_SQL = """
 CREATE SCHEMA IF NOT EXISTS pond;
@@ -67,6 +70,7 @@ class SiteStore:
                     self._pool = pool
                 except Exception as exc:  # noqa: BLE001 - any driver error means "down"
                     self._down_until = time.time() + 30
+                    log.error("cannot connect to PostgreSQL (%s); saved sites are off for 30 s", type(exc).__name__)
                     raise SitesUnavailable("Database unavailable.") from exc
         return self._pool
 
@@ -79,6 +83,7 @@ class SiteStore:
         except Exception as exc:  # noqa: BLE001
             pool.putconn(conn, close=True)
             conn = None
+            log.error("database query failed: %s", type(exc).__name__)
             raise SitesUnavailable("Database error.") from exc
         finally:
             if conn is not None:

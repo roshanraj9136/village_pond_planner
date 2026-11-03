@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import socket
@@ -26,7 +27,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -38,11 +39,15 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 import planner
+import telemetry
 from contours import ContourError, contour_interval, contour_layer, contours_to_grid, parse_contours, read_kml_bytes
 from dem import DemStore, TileUnavailable
 from geo import GeometryError, parse_polygon
 from rainfall import RainfallService, water_budget
 from sites import SitesUnavailable, SiteStore
+from telemetry import stage, tracer
+
+log = logging.getLogger("jaldrishti.worker")
 
 BASE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("POND_DATA", str(Path.home() / "pond-data")))
@@ -87,7 +92,7 @@ def _register_loop(gateway: str, key: str, port: str) -> None:
             urllib.request.urlopen(req, timeout=3).close()
         except Exception as exc:  # noqa: BLE001 - this loop must outlive any one failure
             # usually the gateway restarting or a dropped connection; the next round retries
-            print(f"register with gateway failed: {exc!r}", flush=True)
+            log.warning("register with gateway failed: %r", exc)
         time.sleep(10)
 
 
@@ -97,14 +102,19 @@ async def lifespan(_app):
     def warm():
         try:
             if SAMPLE_KML.exists():
-                _contour_flow(SAMPLE_KML.read_bytes(), SAMPLE_KML.name)
+                with tracer.start_as_current_span("warm up: parse sample contour map"):
+                    _contour_flow(SAMPLE_KML.read_bytes(), SAMPLE_KML.name)
         except Exception:  # noqa: BLE001 - warming is best effort
             pass
     threading.Thread(target=warm, daemon=True).start()
     gateway, key = os.environ.get("GATEWAY_URL"), os.environ.get("REGISTER_KEY", "").strip()
     if gateway and key and os.environ.get("PORT"):
         threading.Thread(target=_register_loop, args=(gateway, key, os.environ["PORT"]), daemon=True).start()
+    log.info("worker %s (version %s) ready; telemetry export %s", WORKER, VERSION,
+             "on" if telemetry.enabled() else "off")
     yield
+    log.info("worker %s stopping", WORKER)
+    telemetry.shutdown()
 
 
 app = FastAPI(
@@ -124,6 +134,10 @@ async def tag_worker(request: Request, call_next):
     response.headers["X-Worker"] = WORKER
     response.headers["Server-Timing"] = f"app;dur={(time.perf_counter() - t) * 1e3:.1f}"
     return response
+
+
+# traces, metrics and logs over OTLP (only when OTEL_EXPORTER_OTLP_ENDPOINT is set)
+telemetry.setup(app, VERSION, WORKER)
 
 
 class Busy(Exception):
@@ -149,10 +163,21 @@ class compute_slot:
     def __enter__(self):
         with _stats_lock:
             stats["inflight"] += 1
-        if not COMPUTE.acquire(timeout=QUEUE_WAIT_S):
+        telemetry.INFLIGHT.add(1)
+        t = time.perf_counter()
+        with tracer.start_as_current_span("wait for compute slot") as span:
+            got = COMPUTE.acquire(timeout=QUEUE_WAIT_S)
+            waited = time.perf_counter() - t
+            span.set_attributes({"pond.compute.wait_ms": round(waited * 1e3, 1), "pond.compute.acquired": got})
+        telemetry.WAIT_S.record(waited, {"pond.outcome": "acquired" if got else "rejected"})
+        if not got:
             with _stats_lock:
                 stats["inflight"] -= 1
                 stats["rejected"] += 1
+            telemetry.INFLIGHT.add(-1)
+            telemetry.REJECTED.add(1)
+            log.warning("compute slot still busy after %.0f s; answering 503 so the gateway can use another worker",
+                        QUEUE_WAIT_S)
             raise Busy()
         self.t0 = time.perf_counter()
         return self
@@ -160,6 +185,7 @@ class compute_slot:
     def __exit__(self, exc_type, exc, tb):
         COMPUTE.release()
         malloc_trim()
+        telemetry.INFLIGHT.add(-1)
         with _stats_lock:
             stats["inflight"] -= 1
             stats["served"] += 1
@@ -232,15 +258,62 @@ def _finish(result: dict, t0: float) -> dict:
 
 # ------------------------------------------------------------------ core analyses
 
+@contextmanager
+def analysis(source: str):
+    """One analysis: a span (parent of the pipeline stages) and a pond.analysis.duration sample."""
+    t = time.perf_counter()
+    outcome = "error"
+    name = "analyse parcel" if source == "satellite_dem" else "analyse contour map"
+    with tracer.start_as_current_span(name, attributes={"pond.source": source}) as span:
+        try:
+            yield span
+            outcome = "ok"
+        except Busy:
+            outcome = "busy"
+            raise
+        except (GeometryError, ContourError):
+            outcome = "invalid_input"
+            raise
+        finally:
+            span.set_attribute("pond.outcome", outcome)
+            telemetry.ANALYSIS_S.record(time.perf_counter() - t, {"pond.source": source, "pond.outcome": outcome})
+
+
+def _record(span, result: dict) -> None:
+    """Put the answer on the trace, the metrics and the log: what was found and how long it took."""
+    c, p, w = result["catchment"], result["pond"], result["water"]
+    source = result["source"].get("type", "unknown")
+    span.set_attributes({
+        "pond.catchment.area_ha": c["area_ha"],
+        "pond.catchment.touches_edge": c["touches_data_edge"],
+        "pond.surface_area_m2": p["surface_area_m2"],
+        "pond.water.runoff_m3": w["harvestable_runoff_m3"],
+        "pond.water.collectable_m3": w["collectable_volume_m3"],
+        "pond.rainfall.fallback": bool(w["is_fallback"]),
+    })
+    telemetry.CATCHMENT_HA.record(c["area_ha"], {"pond.source": source})
+    telemetry.COLLECTABLE_M3.record(w["collectable_volume_m3"], {"pond.source": source})
+    log.info("pond site found: catchment %.1f ha, pond %.0f m2, %.0f m3 collectable per year, %.0f ms",
+             c["area_ha"], p["surface_area_m2"], w["collectable_volume_m3"], result["timings_ms"]["total"],
+             extra={"pond.source": source, "pond.catchment.area_ha": c["area_ha"],
+                    "pond.water.collectable_m3": w["collectable_volume_m3"],
+                    "pond.duration_ms": result["timings_ms"]["total"]})
+
+
 def analyze_parcel(area: dict, params: planner.Params) -> dict:
     t0 = time.perf_counter()
-    ring = parse_polygon(area)
-    info = planner.validate_parcel(ring)
-    with compute_slot():
-        hydro, meta = planner.dem_hydrology(dem_store, ring, info)
-        result = planner.build_result(hydro, ring, info, params, rain)
-    result["analysis_window"] = meta
-    return _finish(result, t0)
+    with analysis("satellite_dem") as span:
+        ring = parse_polygon(area)
+        info = planner.validate_parcel(ring)
+        span.set_attribute("pond.parcel.area_ha", round(info["area_m2"] / 1e4, 3))
+        with compute_slot():
+            hydro, meta = planner.dem_hydrology(dem_store, ring, info)
+            result = planner.build_result(hydro, ring, info, params, rain)
+        result["analysis_window"] = meta
+        span.set_attribute("pond.window.attempts", len(meta["window_attempts"]))
+        out = _finish(result, t0)
+        _record(span, out)
+        return out
 
 
 def _contour_flow(data: bytes, filename: str):
@@ -249,9 +322,14 @@ def _contour_flow(data: bytes, filename: str):
         hit = _flow_cache.get(key)
         if hit:
             _flow_cache.move_to_end(key)
+            telemetry.FLOW_CACHE.add(1, {"pond.cache.result": "hit"})
             return hit + (True,)
-    lines = parse_contours(read_kml_bytes(data, filename))
-    grid = contours_to_grid(lines)
+    telemetry.FLOW_CACHE.add(1, {"pond.cache.result": "miss"})
+    with stage("parse contour map", "parse", **{"pond.contour.bytes": len(data)}) as span:
+        lines = parse_contours(read_kml_bytes(data, filename))
+        span.set_attribute("pond.contour.lines", len(lines))
+    with stage("build elevation grid", "grid"):
+        grid = contours_to_grid(lines)
     fm = planner.flow_model(grid)
     meta = contour_metadata(lines, filename)
     layer = {"type": "FeatureCollection", "features": contour_layer(lines)}
@@ -280,18 +358,22 @@ def contour_metadata(lines, filename: str) -> dict:
 
 def analyze_contour(data: bytes, filename: str, area: dict | None, params: planner.Params) -> dict:
     t0 = time.perf_counter()
-    ring = parse_polygon(area) if area else None
-    info = planner.validate_parcel(ring) if ring else None
-    with compute_slot():
-        fm, meta, layer, cached = _contour_flow(data, filename)
-        hydro = planner.select_site(fm, ring)
-        if cached:
-            hydro.ms = {k: 0.0 for k in ("fill", "flow")} | {k: v for k, v in hydro.ms.items() if k not in ("fill", "flow")}
-        result = planner.build_result(hydro, ring, info, params, rain,
-                                      extra_layers={"contours": layer, "contour_interval_m": meta["contour_interval_m"]})
-    result["contour_map"] = meta
-    result["source"] = {**result["source"], "name": f"Contour map: {filename}", "flow_model_cached": cached}
-    return _finish(result, t0)
+    with analysis("contour_map") as span:
+        ring = parse_polygon(area) if area else None
+        info = planner.validate_parcel(ring) if ring else None
+        with compute_slot():
+            fm, meta, layer, cached = _contour_flow(data, filename)
+            span.set_attribute("pond.flow_model.cached", cached)
+            hydro = planner.select_site(fm, ring)
+            if cached:
+                hydro.ms = {k: 0.0 for k in ("fill", "flow")} | {k: v for k, v in hydro.ms.items() if k not in ("fill", "flow")}
+            result = planner.build_result(hydro, ring, info, params, rain,
+                                          extra_layers={"contours": layer, "contour_interval_m": meta["contour_interval_m"]})
+        result["contour_map"] = meta
+        result["source"] = {**result["source"], "name": f"Contour map: {filename}", "flow_model_cached": cached}
+        out = _finish(result, t0)
+        _record(span, out)
+        return out
 
 
 def legacy_response(result: dict) -> dict:
